@@ -9,6 +9,8 @@
  *   - AutoRuns       PK id            GSI userId-index (PK gsiUserId)
  *   - AutoApprovals  PK id            GSI userId-index (PK gsiUserId),
  *                                     GSI userKitKey-index (PK gsiUserKitKey)
+ *   - AutoSchedules  PK id            GSI userId-index (PK gsiUserId),
+ *                                     GSI dueIndex (PK gsiDue, SK nextRunAt)
  */
 
 import { describe, it } from "vitest";
@@ -23,6 +25,7 @@ import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import {
   DynamoAutoRunRepository,
   DynamoAutoApprovalRepository,
+  DynamoAutoScheduleRepository,
 } from "../src/adapters/aws/index.js";
 import { runRepositoryContract } from "./repository-contract.js";
 
@@ -35,6 +38,7 @@ if (!endpoint) {
 } else {
   const RUNS = "AutoRuns-test";
   const APPROVALS = "AutoApprovals-test";
+  const SCHEDULES = "AutoSchedules-test";
 
   const raw = new DynamoDBClient({
     endpoint,
@@ -83,6 +87,33 @@ if (!endpoint) {
     ],
   };
 
+  const schedulesTable: CreateTableCommandInput = {
+    TableName: SCHEDULES,
+    BillingMode: "PAY_PER_REQUEST",
+    AttributeDefinitions: [
+      { AttributeName: "id", AttributeType: "S" },
+      { AttributeName: "gsiUserId", AttributeType: "S" },
+      { AttributeName: "gsiDue", AttributeType: "S" },
+      { AttributeName: "nextRunAt", AttributeType: "S" },
+    ],
+    KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: "userId-index",
+        KeySchema: [{ AttributeName: "gsiUserId", KeyType: "HASH" }],
+        Projection: { ProjectionType: "ALL" },
+      },
+      {
+        IndexName: "dueIndex",
+        KeySchema: [
+          { AttributeName: "gsiDue", KeyType: "HASH" },
+          { AttributeName: "nextRunAt", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
+  };
+
   const drop = async (name: string): Promise<void> => {
     const { TableNames } = await raw.send(new ListTablesCommand({}));
     if (TableNames?.includes(name)) await raw.send(new DeleteTableCommand({ TableName: name }));
@@ -92,12 +123,15 @@ if (!endpoint) {
     const reset = async (): Promise<void> => {
       await drop(RUNS);
       await drop(APPROVALS);
+      await drop(SCHEDULES);
       await raw.send(new CreateTableCommand(runsTable));
       await raw.send(new CreateTableCommand(approvalsTable));
+      await raw.send(new CreateTableCommand(schedulesTable));
     };
     return {
       runs: new DynamoAutoRunRepository(db, RUNS),
       approvals: new DynamoAutoApprovalRepository(db, APPROVALS),
+      schedules: new DynamoAutoScheduleRepository(db, SCHEDULES),
       reset,
     };
   });

@@ -29,6 +29,7 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
+  DeleteCommand,
   GetCommand,
   PutCommand,
   UpdateCommand,
@@ -37,7 +38,9 @@ import {
 import type {
   AutoApprovalRepository,
   AutoRunRepository,
+  AutoScheduleRepository,
   AutoStorageDeps,
+  ScheduleRunResult,
 } from "../../core/ports.js";
 import type {
   AuditEntry,
@@ -45,9 +48,12 @@ import type {
   AutoRun,
   AutoRunResult,
   AutoRunStatus,
+  AutoSchedule,
   CreateApprovalInput,
   CreateRunInput,
+  CreateScheduleInput,
   KitRef,
+  UpdateScheduleInput,
 } from "../../core/types.js";
 import { kitRefKey } from "../../core/types.js";
 import { FsWorkspaceStore } from "../../core/fs-workspace.js";
@@ -82,11 +88,13 @@ export function createDynamoDBDocumentClient(
 export interface AutoDynamoTableNames {
   runs: string;
   approvals: string;
+  schedules: string;
 }
 
 export const AUTO_TABLE_ENV_VARS = {
   runs: "AUTO_RUNS_TABLE",
   approvals: "AUTO_APPROVALS_TABLE",
+  schedules: "AUTO_SCHEDULES_TABLE",
 } as const;
 
 export function loadAutoDynamoTableNames(
@@ -102,6 +110,7 @@ export function loadAutoDynamoTableNames(
   return {
     runs: resolve(AUTO_TABLE_ENV_VARS.runs),
     approvals: resolve(AUTO_TABLE_ENV_VARS.approvals),
+    schedules: resolve(AUTO_TABLE_ENV_VARS.schedules),
   };
 }
 
@@ -135,6 +144,8 @@ export class DynamoAutoRunRepository implements AutoRunRepository {
       createdAt: input.createdAt,
       auditLog: [],
       cancelRequested: false,
+      trigger: input.trigger ?? "on_demand",
+      ...(input.scheduleId !== undefined ? { scheduleId: input.scheduleId } : {}),
     };
     await this.db.send(
       new PutCommand({
@@ -337,6 +348,164 @@ function stripApprovalGsi(item: Record<string, unknown>): AutoApproval {
 }
 
 // ---------------------------------------------------------------------------
+// DynamoDB AutoScheduleRepository (Phase B)
+// ---------------------------------------------------------------------------
+
+/**
+ * Table `AutoSchedules`, PK `id`.
+ *   - GSI `userId-index`  (PK gsiUserId)        — listSchedulesByUser.
+ *   - GSI `dueIndex`      (PK gsiDue, SK nextRunAt)
+ *       gsiDue is a CONSTANT partition ("1") for every ENABLED schedule, and is
+ *       REMOVED when a schedule is disabled. listDueSchedules then becomes a
+ *       single Query on gsiDue="1" with KeyCondition nextRunAt <= now — only the
+ *       enabled, actually-due rows are read (no table scan).
+ *
+ *       Tradeoff: a single hot partition for due-selection. At Phase B scale
+ *       (cron schedules per user, swept once/minute) this is well within a
+ *       partition's throughput; if it ever became hot we'd shard gsiDue by a
+ *       bucket prefix and fan the sweep across buckets. Documented here so the
+ *       CDK stack (agentkitauto-infra) mirrors the key schema.
+ */
+const DUE_PARTITION = "1";
+
+function scheduleGsiFields(s: AutoSchedule): Record<string, unknown> {
+  return {
+    gsiUserId: s.userId,
+    // Only enabled schedules participate in the due index.
+    ...(s.enabled ? { gsiDue: DUE_PARTITION } : {}),
+  };
+}
+
+export class DynamoAutoScheduleRepository implements AutoScheduleRepository {
+  constructor(
+    private readonly db: DynamoDBDocumentClient,
+    private readonly tableName: string,
+  ) {}
+
+  async createSchedule(input: CreateScheduleInput): Promise<AutoSchedule> {
+    const schedule: AutoSchedule = {
+      id: randomUUID(),
+      userId: input.userId,
+      kitRef: input.kitRef,
+      cron: input.cron,
+      timezone: input.timezone ?? "UTC",
+      input: input.input,
+      budgetCents: input.budgetCents,
+      model: input.model,
+      approvalId: input.approvalId,
+      ...(input.inferenceMode !== undefined ? { inferenceMode: input.inferenceMode } : {}),
+      enabled: input.enabled ?? true,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+      lastRunAt: null,
+      lastRunId: null,
+      nextRunAt: input.nextRunAt,
+      lastError: null,
+    };
+    await this.db.send(
+      new PutCommand({
+        TableName: this.tableName,
+        Item: { ...schedule, ...scheduleGsiFields(schedule) },
+      }),
+    );
+    return schedule;
+  }
+
+  async getSchedule(scheduleId: string): Promise<AutoSchedule | undefined> {
+    const result = await this.db.send(
+      new GetCommand({ TableName: this.tableName, Key: { id: scheduleId } }),
+    );
+    return result.Item ? stripScheduleGsi(result.Item) : undefined;
+  }
+
+  async listSchedulesByUser(userId: string): Promise<AutoSchedule[]> {
+    const result = await this.db.send(
+      new QueryCommand({
+        TableName: this.tableName,
+        IndexName: "userId-index",
+        KeyConditionExpression: "gsiUserId = :u",
+        ExpressionAttributeValues: { ":u": userId },
+      }),
+    );
+    return (result.Items ?? []).map(stripScheduleGsi);
+  }
+
+  async listDueSchedules(nowISO: string): Promise<AutoSchedule[]> {
+    const result = await this.db.send(
+      new QueryCommand({
+        TableName: this.tableName,
+        IndexName: "dueIndex",
+        KeyConditionExpression: "gsiDue = :p AND nextRunAt <= :now",
+        ExpressionAttributeValues: { ":p": DUE_PARTITION, ":now": nowISO },
+      }),
+    );
+    return (result.Items ?? []).map(stripScheduleGsi);
+  }
+
+  async updateSchedule(
+    scheduleId: string,
+    patch: UpdateScheduleInput,
+  ): Promise<AutoSchedule | undefined> {
+    // Read-modify-write: the due-index participation (gsiDue presence) depends on
+    // the post-patch `enabled`, which is simplest to recompute from the merged
+    // record and re-Put. Schedule edits are low-frequency.
+    const current = await this.getSchedule(scheduleId);
+    if (!current) return undefined;
+    const next: AutoSchedule = {
+      ...current,
+      ...(patch.cron !== undefined ? { cron: patch.cron } : {}),
+      ...(patch.timezone !== undefined ? { timezone: patch.timezone } : {}),
+      ...(patch.input !== undefined ? { input: patch.input } : {}),
+      ...(patch.budgetCents !== undefined ? { budgetCents: patch.budgetCents } : {}),
+      ...(patch.model !== undefined ? { model: patch.model } : {}),
+      ...(patch.approvalId !== undefined ? { approvalId: patch.approvalId } : {}),
+      ...(patch.inferenceMode !== undefined ? { inferenceMode: patch.inferenceMode } : {}),
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      ...(patch.nextRunAt !== undefined ? { nextRunAt: patch.nextRunAt } : {}),
+      updatedAt: patch.updatedAt,
+    };
+    await this.db.send(
+      new PutCommand({
+        TableName: this.tableName,
+        Item: { ...next, ...scheduleGsiFields(next) },
+      }),
+    );
+    return next;
+  }
+
+  async setScheduleRunResult(scheduleId: string, result: ScheduleRunResult): Promise<void> {
+    await this.db.send(
+      new UpdateCommand({
+        TableName: this.tableName,
+        Key: { id: scheduleId },
+        UpdateExpression:
+          "SET lastRunAt = :lra, lastRunId = :lri, nextRunAt = :nra, lastError = :le",
+        ExpressionAttributeValues: {
+          ":lra": result.lastRunAt,
+          ":lri": result.lastRunId,
+          ":nra": result.nextRunAt,
+          ":le": result.lastError,
+        },
+      }),
+    );
+  }
+
+  async deleteSchedule(scheduleId: string): Promise<void> {
+    await this.db.send(
+      new DeleteCommand({ TableName: this.tableName, Key: { id: scheduleId } }),
+    );
+  }
+}
+
+function stripScheduleGsi(item: Record<string, unknown>): AutoSchedule {
+  const { gsiUserId: _u, gsiDue: _d, ...rest } = item as Record<string, unknown> & {
+    gsiUserId?: string;
+    gsiDue?: string;
+  };
+  return rest as unknown as AutoSchedule;
+}
+
+// ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
 
@@ -355,6 +524,7 @@ export function makeAwsAutoDeps(options: MakeAwsAutoDepsOptions = {}): AutoStora
   return {
     runs: new DynamoAutoRunRepository(db, tables.runs),
     approvals: new DynamoAutoApprovalRepository(db, tables.approvals),
+    schedules: new DynamoAutoScheduleRepository(db, tables.schedules),
     workspaces: new FsWorkspaceStore({ rootDir }),
   };
 }

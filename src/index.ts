@@ -21,16 +21,23 @@ export type {
   AutoRunInputFile,
   AutoRunResult,
   AutoRunStatus,
+  AutoSchedule,
   CreateApprovalInput,
   CreateRunInput,
+  CreateScheduleInput,
   InferenceMode,
   KitRef,
   NetworkPolicy,
+  RunTrigger,
+  UpdateScheduleInput,
   WorkspaceFileEntry,
 } from "./core/types.js";
 export {
   autoApprovalSchema,
+  autoRunInputFileSchema,
+  autoRunInputSchema,
   autoRunStatusSchema,
+  autoScheduleSchema,
   kitRefKey,
   kitRefSchema,
 } from "./core/types.js";
@@ -39,10 +46,26 @@ export {
 export type {
   AutoApprovalRepository,
   AutoRunRepository,
+  AutoScheduleRepository,
   AutoStorageDeps,
   ConfigProvider,
+  ScheduleRunResult,
   WorkspaceStore,
 } from "./core/ports.js";
+
+// ---- Cron utils (Phase B) ------------------------------------------------
+export { nextFireAfter, parseCron, validateCron, CronParseError } from "./core/cron.js";
+export type { ParsedCron } from "./core/cron.js";
+
+// ---- Schedule runner (Phase B) -------------------------------------------
+export { runDueSchedules } from "./core/schedule-runner.js";
+export type {
+  CreateAndDispatch,
+  RunDueSchedulesArgs,
+  RunDueSchedulesDeps,
+  ScheduleSweepError,
+  ScheduleSweepSummary,
+} from "./core/schedule-runner.js";
 
 // ---- Sandbox executor (the hands) ---------------------------------------
 export {
@@ -98,6 +121,7 @@ export {
   createDynamoDBDocumentClient,
   DynamoAutoApprovalRepository,
   DynamoAutoRunRepository,
+  DynamoAutoScheduleRepository,
   loadAutoDynamoTableNames,
   makeAwsAutoDeps,
 } from "./adapters/aws/index.js";
@@ -111,6 +135,7 @@ export {
   makeSelfHostAutoDeps,
   PostgresAutoApprovalRepository,
   PostgresAutoRunRepository,
+  PostgresAutoScheduleRepository,
 } from "./adapters/selfhost/postgres.js";
 export type {
   MakeSelfHostAutoDepsOptions,

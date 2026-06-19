@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS auto_runs (
   error             TEXT,
   audit_log         JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- append-only
   workspace_id      TEXT,
-  cancel_requested  BOOLEAN     NOT NULL DEFAULT FALSE
+  cancel_requested  BOOLEAN     NOT NULL DEFAULT FALSE,
+  -- Phase B (scheduled runs): how this run was triggered + the firing schedule.
+  trigger           TEXT        NOT NULL DEFAULT 'on_demand',  -- on_demand|schedule
+  schedule_id       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS auto_runs_user_idx ON auto_runs (user_id, created_at DESC);
@@ -63,3 +66,34 @@ CREATE TABLE IF NOT EXISTS auto_approvals (
 
 CREATE INDEX IF NOT EXISTS auto_approvals_user_idx ON auto_approvals (user_id);
 CREATE INDEX IF NOT EXISTS auto_approvals_user_kit_idx ON auto_approvals (user_kit_key);
+
+-- Idempotent migration for existing deployments (Phase B columns).
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS trigger     TEXT NOT NULL DEFAULT 'on_demand';
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS schedule_id TEXT;
+
+-- ---------------------------------------------------------------------------
+-- Auto schedules (Phase B — scheduled / cron runs)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS auto_schedules (
+  id                TEXT        NOT NULL PRIMARY KEY,
+  user_id           TEXT        NOT NULL,
+  kit_ref           JSONB       NOT NULL,
+  cron              TEXT        NOT NULL,   -- standard 5-field cron
+  timezone          TEXT        NOT NULL DEFAULT 'UTC',  -- IANA tz
+  input             JSONB       NOT NULL,   -- per-run { prompt, files? }
+  budget_cents      INTEGER     NOT NULL,   -- REQUIRED per-run budget
+  model             TEXT        NOT NULL,
+  approval_id       TEXT        NOT NULL,   -- standing approval this runs under
+  inference_mode    TEXT,                   -- managed|byo (NULL = run default)
+  enabled           BOOLEAN     NOT NULL DEFAULT TRUE,
+  created_at        TEXT        NOT NULL,   -- ISO 8601
+  updated_at        TEXT        NOT NULL,
+  last_run_at       TEXT,                   -- ISO of last fire (NULL until first)
+  last_run_id       TEXT,                   -- run id of last fire
+  next_run_at       TEXT        NOT NULL,   -- ISO of next scheduled fire (due key)
+  last_error        TEXT                    -- last skip/dispatch error
+);
+
+CREATE INDEX IF NOT EXISTS auto_schedules_user_idx ON auto_schedules (user_id);
+-- Due-selection: enabled schedules ordered by next_run_at.
+CREATE INDEX IF NOT EXISTS auto_schedules_due_idx ON auto_schedules (enabled, next_run_at);

@@ -17,17 +17,23 @@ import * as os from "node:os";
 import type {
   AutoApprovalRepository,
   AutoRunRepository,
+  AutoScheduleRepository,
   AutoStorageDeps,
+  ScheduleRunResult,
 } from "../../core/ports.js";
 import type {
   AuditEntry,
   AutoApproval,
   AutoRun,
+  AutoRunInput,
   AutoRunResult,
   AutoRunStatus,
+  AutoSchedule,
   CreateApprovalInput,
   CreateRunInput,
+  CreateScheduleInput,
   KitRef,
+  UpdateScheduleInput,
 } from "../../core/types.js";
 import { kitRefKey } from "../../core/types.js";
 import { FsWorkspaceStore } from "../../core/fs-workspace.js";
@@ -64,7 +70,9 @@ function rowToRun(row: Record<string, unknown>): AutoRun {
     createdAt: row["created_at"] as string,
     auditLog: asJson<AuditEntry[]>(row["audit_log"] ?? "[]"),
     cancelRequested: row["cancel_requested"] === true || row["cancel_requested"] === "true",
+    trigger: (row["trigger"] as AutoRun["trigger"]) ?? "on_demand",
   };
+  if (row["schedule_id"]) run.scheduleId = row["schedule_id"] as string;
   if (row["started_at"]) run.startedAt = row["started_at"] as string;
   if (row["finished_at"]) run.finishedAt = row["finished_at"] as string;
   if (row["error"]) run.error = row["error"] as string;
@@ -100,8 +108,9 @@ export class PostgresAutoRunRepository implements AutoRunRepository {
       `INSERT INTO auto_runs
          (id, user_id, kit_ref, status, input, budget_cents, spent_cents,
           spent_inference_cents, spent_compute_cents, inference_mode,
-          is_cloud_run, cloud_run_cents_per_min, model, created_at, audit_log, cancel_requested)
-       VALUES ($1,$2,$3,'queued',$4,$5,0,0,0,$6,$7,$8,$9,$10,$11,FALSE)
+          is_cloud_run, cloud_run_cents_per_min, model, created_at, audit_log, cancel_requested,
+          trigger, schedule_id)
+       VALUES ($1,$2,$3,'queued',$4,$5,0,0,0,$6,$7,$8,$9,$10,$11,FALSE,$12,$13)
        RETURNING *`,
       [
         id,
@@ -115,6 +124,8 @@ export class PostgresAutoRunRepository implements AutoRunRepository {
         input.model,
         input.createdAt,
         "[]",
+        input.trigger ?? "on_demand",
+        input.scheduleId ?? null,
       ],
     );
     return rowToRun(rows[0]!);
@@ -265,6 +276,130 @@ export class PostgresAutoApprovalRepository implements AutoApprovalRepository {
 }
 
 // ---------------------------------------------------------------------------
+// Postgres AutoScheduleRepository (Phase B)
+// ---------------------------------------------------------------------------
+
+function rowToSchedule(row: Record<string, unknown>): AutoSchedule {
+  const schedule: AutoSchedule = {
+    id: row["id"] as string,
+    userId: row["user_id"] as string,
+    kitRef: asJson<KitRef>(row["kit_ref"]),
+    cron: row["cron"] as string,
+    timezone: row["timezone"] as string,
+    input: asJson<AutoRunInput>(row["input"]),
+    budgetCents: Number(row["budget_cents"]),
+    model: row["model"] as string,
+    approvalId: row["approval_id"] as string,
+    enabled: row["enabled"] === true || row["enabled"] === "true",
+    createdAt: row["created_at"] as string,
+    updatedAt: row["updated_at"] as string,
+    lastRunAt: (row["last_run_at"] as string | null) ?? null,
+    lastRunId: (row["last_run_id"] as string | null) ?? null,
+    nextRunAt: row["next_run_at"] as string,
+    lastError: (row["last_error"] as string | null) ?? null,
+  };
+  if (row["inference_mode"]) {
+    schedule.inferenceMode = row["inference_mode"] as AutoSchedule["inferenceMode"];
+  }
+  return schedule;
+}
+
+export class PostgresAutoScheduleRepository implements AutoScheduleRepository {
+  constructor(private readonly pool: PgPool) {}
+
+  async createSchedule(input: CreateScheduleInput): Promise<AutoSchedule> {
+    const id = randomUUID();
+    const { rows } = await this.pool.query(
+      `INSERT INTO auto_schedules
+         (id, user_id, kit_ref, cron, timezone, input, budget_cents, model,
+          approval_id, inference_mode, enabled, created_at, updated_at,
+          last_run_at, last_run_id, next_run_at, last_error)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,NULL,NULL,$13,NULL)
+       RETURNING *`,
+      [
+        id,
+        input.userId,
+        JSON.stringify(input.kitRef),
+        input.cron,
+        input.timezone ?? "UTC",
+        JSON.stringify(input.input),
+        input.budgetCents,
+        input.model,
+        input.approvalId,
+        input.inferenceMode ?? null,
+        input.enabled ?? true,
+        input.createdAt,
+        input.nextRunAt,
+      ],
+    );
+    return rowToSchedule(rows[0]!);
+  }
+
+  async getSchedule(scheduleId: string): Promise<AutoSchedule | undefined> {
+    const { rows } = await this.pool.query("SELECT * FROM auto_schedules WHERE id = $1", [
+      scheduleId,
+    ]);
+    return rows[0] ? rowToSchedule(rows[0]) : undefined;
+  }
+
+  async listSchedulesByUser(userId: string): Promise<AutoSchedule[]> {
+    const { rows } = await this.pool.query(
+      "SELECT * FROM auto_schedules WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId],
+    );
+    return rows.map(rowToSchedule);
+  }
+
+  async listDueSchedules(nowISO: string): Promise<AutoSchedule[]> {
+    // enabled && next_run_at <= now. Indexed on (enabled, next_run_at).
+    const { rows } = await this.pool.query(
+      "SELECT * FROM auto_schedules WHERE enabled = TRUE AND next_run_at <= $1 ORDER BY next_run_at ASC",
+      [nowISO],
+    );
+    return rows.map(rowToSchedule);
+  }
+
+  async updateSchedule(
+    scheduleId: string,
+    patch: UpdateScheduleInput,
+  ): Promise<AutoSchedule | undefined> {
+    const sets = ["updated_at = $2"];
+    const params: unknown[] = [scheduleId, patch.updatedAt];
+    const push = (col: string, value: unknown): void => {
+      params.push(value);
+      sets.push(`${col} = $${params.length}`);
+    };
+    if (patch.cron !== undefined) push("cron", patch.cron);
+    if (patch.timezone !== undefined) push("timezone", patch.timezone);
+    if (patch.input !== undefined) push("input", JSON.stringify(patch.input));
+    if (patch.budgetCents !== undefined) push("budget_cents", patch.budgetCents);
+    if (patch.model !== undefined) push("model", patch.model);
+    if (patch.approvalId !== undefined) push("approval_id", patch.approvalId);
+    if (patch.inferenceMode !== undefined) push("inference_mode", patch.inferenceMode);
+    if (patch.enabled !== undefined) push("enabled", patch.enabled);
+    if (patch.nextRunAt !== undefined) push("next_run_at", patch.nextRunAt);
+    const { rows } = await this.pool.query(
+      `UPDATE auto_schedules SET ${sets.join(", ")} WHERE id = $1 RETURNING *`,
+      params,
+    );
+    return rows[0] ? rowToSchedule(rows[0]) : undefined;
+  }
+
+  async setScheduleRunResult(scheduleId: string, result: ScheduleRunResult): Promise<void> {
+    await this.pool.query(
+      `UPDATE auto_schedules
+         SET last_run_at = $2, last_run_id = $3, next_run_at = $4, last_error = $5
+       WHERE id = $1`,
+      [scheduleId, result.lastRunAt, result.lastRunId, result.nextRunAt, result.lastError],
+    );
+  }
+
+  async deleteSchedule(scheduleId: string): Promise<void> {
+    await this.pool.query("DELETE FROM auto_schedules WHERE id = $1", [scheduleId]);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
 
@@ -280,6 +415,7 @@ export function makeSelfHostAutoDeps(options: MakeSelfHostAutoDepsOptions): Auto
   return {
     runs: new PostgresAutoRunRepository(options.pool),
     approvals: new PostgresAutoApprovalRepository(options.pool),
+    schedules: new PostgresAutoScheduleRepository(options.pool),
     workspaces: new FsWorkspaceStore({ rootDir }),
   };
 }

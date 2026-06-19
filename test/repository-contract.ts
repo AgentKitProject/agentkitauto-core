@@ -5,12 +5,21 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import type { AutoApprovalRepository, AutoRunRepository } from "../src/core/ports.js";
-import type { CreateRunInput, CreateApprovalInput } from "../src/core/types.js";
+import type {
+  AutoApprovalRepository,
+  AutoRunRepository,
+  AutoScheduleRepository,
+} from "../src/core/ports.js";
+import type {
+  CreateRunInput,
+  CreateApprovalInput,
+  CreateScheduleInput,
+} from "../src/core/types.js";
 
 export interface ContractRepos {
   runs: AutoRunRepository;
   approvals: AutoApprovalRepository;
+  schedules: AutoScheduleRepository;
   reset: () => Promise<void>;
 }
 
@@ -35,6 +44,22 @@ function approvalInput(over: Partial<CreateApprovalInput> = {}): CreateApprovalI
     toolAllowlist: ["read_file", "write_file"],
     maxBudgetCents: 1000,
     createdAt: NOW,
+    ...over,
+  };
+}
+
+function scheduleInput(over: Partial<CreateScheduleInput> = {}): CreateScheduleInput {
+  return {
+    userId: "u1",
+    kitRef: { source: "local", localKitId: "k1" },
+    cron: "*/5 * * * *",
+    timezone: "UTC",
+    input: { prompt: "do it", files: [{ path: "in.txt", content: "x" }] },
+    budgetCents: 200,
+    model: "claude-sonnet-4-6",
+    approvalId: "appr-1",
+    createdAt: NOW,
+    nextRunAt: "2026-06-18T00:05:00.000Z",
     ...over,
   };
 }
@@ -118,6 +143,93 @@ export function runRepositoryContract(label: string, makeRepos: () => Promise<Co
       // Still listed (for history), but revoked.
       const listed = await repos.approvals.listApprovalsByUser("u1");
       expect(listed.find((a) => a.id === created.id)?.revokedAt).toBe(NOW);
+    });
+
+    // ---- Runs: Phase B trigger/scheduleId back-compat -------------------
+    it("defaults trigger to on_demand and round-trips schedule runs", async () => {
+      const onDemand = await repos.runs.createRun(runInput());
+      expect((await repos.runs.getRun(onDemand.id))?.trigger).toBe("on_demand");
+
+      const scheduled = await repos.runs.createRun(
+        runInput({ trigger: "schedule", scheduleId: "sched-1" }),
+      );
+      const fetched = await repos.runs.getRun(scheduled.id);
+      expect(fetched?.trigger).toBe("schedule");
+      expect(fetched?.scheduleId).toBe("sched-1");
+    });
+
+    // ---- Schedules (Phase B) --------------------------------------------
+    it("creates + reads a schedule (round-trips kitRef + input + cron)", async () => {
+      const created = await repos.schedules.createSchedule(scheduleInput());
+      expect(created.enabled).toBe(true);
+      expect(created.lastRunAt).toBeNull();
+      const fetched = await repos.schedules.getSchedule(created.id);
+      expect(fetched?.cron).toBe("*/5 * * * *");
+      expect(fetched?.timezone).toBe("UTC");
+      expect(fetched?.kitRef).toEqual({ source: "local", localKitId: "k1" });
+      expect(fetched?.input.prompt).toBe("do it");
+      expect(fetched?.nextRunAt).toBe("2026-06-18T00:05:00.000Z");
+    });
+
+    it("lists schedules by user", async () => {
+      await repos.schedules.createSchedule(scheduleInput());
+      await repos.schedules.createSchedule(scheduleInput());
+      await repos.schedules.createSchedule(scheduleInput({ userId: "other" }));
+      expect((await repos.schedules.listSchedulesByUser("u1")).length).toBe(2);
+      expect((await repos.schedules.listSchedulesByUser("other")).length).toBe(1);
+    });
+
+    it("selects only enabled + due schedules", async () => {
+      const due = await repos.schedules.createSchedule(
+        scheduleInput({ nextRunAt: "2026-06-18T00:00:00.000Z" }),
+      );
+      // Not yet due.
+      await repos.schedules.createSchedule(
+        scheduleInput({ nextRunAt: "2099-01-01T00:00:00.000Z" }),
+      );
+      // Due but disabled.
+      await repos.schedules.createSchedule(
+        scheduleInput({ enabled: false, nextRunAt: "2026-06-18T00:00:00.000Z" }),
+      );
+      const dueList = await repos.schedules.listDueSchedules("2026-06-18T00:01:00.000Z");
+      expect(dueList.map((s) => s.id)).toEqual([due.id]);
+    });
+
+    it("disabling a schedule removes it from the due set", async () => {
+      const created = await repos.schedules.createSchedule(
+        scheduleInput({ nextRunAt: "2026-06-18T00:00:00.000Z" }),
+      );
+      expect((await repos.schedules.listDueSchedules(NOW)).length).toBe(1);
+      const updated = await repos.schedules.updateSchedule(created.id, {
+        enabled: false,
+        updatedAt: NOW,
+      });
+      expect(updated?.enabled).toBe(false);
+      expect((await repos.schedules.listDueSchedules(NOW)).length).toBe(0);
+    });
+
+    it("records a fire result (advances nextRunAt; stamps lastRunId/lastError)", async () => {
+      const created = await repos.schedules.createSchedule(
+        scheduleInput({ nextRunAt: "2026-06-18T00:00:00.000Z" }),
+      );
+      await repos.schedules.setScheduleRunResult(created.id, {
+        lastRunAt: NOW,
+        lastRunId: "run-xyz",
+        nextRunAt: "2026-06-18T00:05:00.000Z",
+        lastError: null,
+      });
+      const fetched = await repos.schedules.getSchedule(created.id);
+      expect(fetched?.lastRunId).toBe("run-xyz");
+      expect(fetched?.nextRunAt).toBe("2026-06-18T00:05:00.000Z");
+      expect(fetched?.lastError).toBeNull();
+      // Advanced past now → no longer due.
+      expect((await repos.schedules.listDueSchedules("2026-06-18T00:01:00.000Z")).length).toBe(0);
+    });
+
+    it("deletes a schedule", async () => {
+      const created = await repos.schedules.createSchedule(scheduleInput());
+      await repos.schedules.deleteSchedule(created.id);
+      expect(await repos.schedules.getSchedule(created.id)).toBeUndefined();
     });
   });
 }

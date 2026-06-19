@@ -11,6 +11,7 @@ import { newDb } from "pg-mem";
 import {
   PostgresAutoRunRepository,
   PostgresAutoApprovalRepository,
+  PostgresAutoScheduleRepository,
   type PgPool,
 } from "../src/adapters/selfhost/postgres.js";
 import { runRepositoryContract, type ContractRepos } from "./repository-contract.js";
@@ -32,6 +33,7 @@ runRepositoryContract("postgres (pg-mem)", async () => {
     repos = {
       runs: new PostgresAutoRunRepository(pool),
       approvals: new PostgresAutoApprovalRepository(pool),
+      schedules: new PostgresAutoScheduleRepository(pool),
       reset,
     };
   };
@@ -44,6 +46,9 @@ runRepositoryContract("postgres (pg-mem)", async () => {
     },
     get approvals() {
       return repos.approvals;
+    },
+    get schedules() {
+      return repos.schedules;
     },
     reset,
   };
