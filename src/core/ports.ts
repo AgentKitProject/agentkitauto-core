@@ -19,14 +19,18 @@ import type {
   AuditEntry,
   AutoApproval,
   AutoRun,
+  AutoRunInputFileRef,
   AutoRunResult,
   AutoRunStatus,
   AutoSchedule,
+  AutoWebhook,
   CreateApprovalInput,
   CreateRunInput,
   CreateScheduleInput,
+  CreateWebhookInput,
   KitRef,
   UpdateScheduleInput,
+  WebhookFireResult,
   WorkspaceFileEntry,
 } from "./types.js";
 
@@ -134,6 +138,74 @@ export interface AutoScheduleRepository {
 }
 
 // ---------------------------------------------------------------------------
+// AutoWebhookRepository (Phase C)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persists standing webhook triggers (Phase C).
+ *
+ * INVARIANTS:
+ *   - `secretHash` is stored verbatim; the plaintext secret is NEVER persisted.
+ *   - recordFire is additive on fireCount and stamps lastFiredAt/lastRunId.
+ *   - getWebhook returns the webhook regardless of enabled state (consumeWebhook
+ *     enforces the enabled check so it can return a typed disabled error).
+ */
+export interface AutoWebhookRepository {
+  createWebhook(input: CreateWebhookInput): Promise<AutoWebhook>;
+  getWebhook(webhookId: string): Promise<AutoWebhook | undefined>;
+  listWebhooksByUser(userId: string): Promise<AutoWebhook[]>;
+  /** Stamps the outcome of a successful fire (lastFiredAt/lastRunId, ++fireCount). */
+  recordFire(webhookId: string, result: WebhookFireResult): Promise<void>;
+  /** Enables/disables a webhook; returns the updated row or undefined. */
+  setEnabled(webhookId: string, enabled: boolean): Promise<AutoWebhook | undefined>;
+  deleteWebhook(webhookId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// InputStore (Phase C — out-of-band per-run input files)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stages + hydrates per-run input files supplied OUT-OF-BAND (the web layer
+ * uploads them — e.g. via presigned S3 PUT — then records the manifest on the
+ * run). The worker hydrates them into the run workspace's `inputs/` subdir
+ * BEFORE execution. All filenames are path-confined (no traversal/symlink
+ * escape) exactly like every other workspace op.
+ *
+ *   - aws/      → S3 under a per-run prefix `auto-inputs/{runId}/...`.
+ *   - selfhost/ → local disk / MinIO under a per-run dir.
+ */
+export interface InputStore {
+  /**
+   * Records/uploads staged input files for a run and returns the manifest to
+   * persist on the run. (The web layer typically uploads bytes via presigned
+   * URLs; this method may be a no-op manifest builder in that flow, or it may
+   * accept inline content for the self-host/local path.)
+   */
+  stageInputs(runId: string, files: StagedInputFile[]): Promise<AutoRunInputFileRef[]>;
+  /**
+   * Copies every staged input file for a run into the workspace under `inputs/`,
+   * path-confined. Returns the workspace-relative paths written.
+   */
+  hydrateInputsIntoWorkspace(
+    runId: string,
+    workspace: WorkspaceStore,
+    workspaceId: string,
+    manifest: AutoRunInputFileRef[],
+  ): Promise<string[]>;
+}
+
+/** An input file presented for staging (inline content or a backing key). */
+export interface StagedInputFile {
+  /** Workspace-relative path (placed under `inputs/`); path-confined. */
+  path: string;
+  /** Inline UTF-8 content (self-host/local) — mutually exclusive with s3Key. */
+  content?: string;
+  /** Pre-uploaded backing object key (aws presigned flow). */
+  s3Key?: string;
+}
+
+// ---------------------------------------------------------------------------
 // WorkspaceStore (the "hands" substrate)
 // ---------------------------------------------------------------------------
 
@@ -169,4 +241,8 @@ export interface AutoStorageDeps {
   workspaces: WorkspaceStore;
   /** Phase B: standing schedules. */
   schedules: AutoScheduleRepository;
+  /** Phase C: standing webhooks (inbound event triggers). */
+  webhooks: AutoWebhookRepository;
+  /** Phase C: staged per-run input files. */
+  inputs: InputStore;
 }

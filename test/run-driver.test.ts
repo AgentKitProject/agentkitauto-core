@@ -70,7 +70,7 @@ const approval: AutoApproval = {
   kitRef: { source: "local", localKitId: "k1" },
   scope: "workspace_read_write",
   toolAllowlist: ["read_file", "list_dir", "write_file"],
-  networkPolicy: "deny_all",
+  networkPolicy: { mode: "deny_all" },
   maxBudgetCents: 100_000,
   createdAt: noopNow(),
   revokedAt: null,

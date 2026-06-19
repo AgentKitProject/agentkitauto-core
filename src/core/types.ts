@@ -67,11 +67,50 @@ export function kitRefKey(ref: KitRef): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Phase A network policy. Only `deny_all` is permitted — egress is deferred to
- * Phase C. The field is included now so the contract is stable across phases.
+ * Network egress policy for autonomous runs (Phase C).
+ *
+ *   - `deny_all` (DEFAULT): no network egress whatsoever. The `http_fetch`
+ *     sandbox tool is UNAVAILABLE. This is the Phase A/B behavior and remains the
+ *     default for every approval that does not explicitly opt in.
+ *   - `allowlist`: egress is permitted ONLY to the listed hosts. Each host is an
+ *     exact hostname (`api.example.com`) or a wildcard SUFFIX (`*.example.com`,
+ *     which matches any subdomain but NOT the apex). `http_fetch` becomes
+ *     available only when this mode is set AND `http_fetch` is in the approval's
+ *     toolAllowlist. Even then every request is https-only and SSRF-guarded
+ *     (private / loopback / link-local / metadata IPs are rejected).
+ *
+ * Stored on the AutoApproval, so consent for egress is part of the standing
+ * approval just like the toolAllowlist. Pre-Phase-C approvals (a bare
+ * `"deny_all"` string, or absent) normalize to `{ mode: "deny_all" }`.
  */
-export const networkPolicySchema = z.literal("deny_all");
+export const networkPolicySchema = z.union([
+  z.object({ mode: z.literal("deny_all") }),
+  z.object({
+    mode: z.literal("allowlist"),
+    /** Exact hostnames or `*.suffix` wildcard-suffix patterns. */
+    hosts: z.array(z.string().min(1)),
+  }),
+]);
 export type NetworkPolicy = z.infer<typeof networkPolicySchema>;
+
+/** The canonical deny-all policy (the default for every approval). */
+export const DENY_ALL_NETWORK_POLICY: NetworkPolicy = { mode: "deny_all" };
+
+/**
+ * Normalizes a persisted/legacy network policy into the Phase C shape. Accepts:
+ *   - the new object shape (returned as-is after a parse),
+ *   - the Phase A/B literal string `"deny_all"`,
+ *   - `undefined`/`null` (pre-Phase-C records),
+ * all of which collapse to `{ mode: "deny_all" }` unless a valid allowlist
+ * object is supplied. Never widens consent: anything unrecognized → deny_all.
+ */
+export function normalizeNetworkPolicy(value: unknown): NetworkPolicy {
+  if (value === "deny_all" || value === undefined || value === null) {
+    return { mode: "deny_all" };
+  }
+  const parsed = networkPolicySchema.safeParse(value);
+  return parsed.success ? parsed.data : { mode: "deny_all" };
+}
 
 /** Phase A scope: a per-run ephemeral workspace the run may read + write. */
 export const approvalScopeSchema = z.literal("workspace_read_write");
@@ -90,7 +129,11 @@ export const autoApprovalSchema = z.object({
   scope: approvalScopeSchema,
   /** Tool names the user authorizes for autonomous use. */
   toolAllowlist: z.array(z.string().min(1)),
-  /** Phase A: always "deny_all". */
+  /**
+   * Network egress policy. Defaults to `{ mode: "deny_all" }`. Set to an
+   * allowlist (with `http_fetch` in toolAllowlist) to opt this approval's runs
+   * into guarded https egress.
+   */
   networkPolicy: networkPolicySchema,
   /** Ceiling (US cents) a single run under this approval may set as its budget. */
   maxBudgetCents: z.number().int().positive(),
@@ -139,8 +182,29 @@ export const autoRunInputSchema = z.object({
   prompt: z.string(),
   /** Optional files seeded into the run workspace before execution. */
   files: z.array(autoRunInputFileSchema).optional(),
+  /**
+   * Optional structured trigger event (Phase C webhooks). When a run is created
+   * from a webhook fire, the webhook's JSON payload is folded in here so the kit
+   * can read the event without it being smuggled into `prompt`. Absent for
+   * on-demand / scheduled runs.
+   */
+  event: z.unknown().optional(),
 });
 export type AutoRunInput = z.infer<typeof autoRunInputSchema>;
+
+/**
+ * A manifest entry for a per-run input file staged OUT-OF-BAND (Phase C user
+ * inputs). Unlike `AutoRunInputFile` (inline content), these reference content
+ * staged in the InputStore (S3 / local disk / MinIO) and are hydrated into the
+ * run workspace's `inputs/` subdir by the worker before execution.
+ */
+export const autoRunInputFileRefSchema = z.object({
+  /** Workspace-relative path under `inputs/` (path-confined; no traversal). */
+  path: z.string().min(1),
+  /** Backing object key in the InputStore (e.g. an S3 key). Optional for local. */
+  s3Key: z.string().min(1).optional(),
+});
+export type AutoRunInputFileRef = z.infer<typeof autoRunInputFileRefSchema>;
 
 /** One file produced by the run, surfaced in the result manifest. */
 export interface WorkspaceFileEntry {
@@ -187,11 +251,13 @@ export interface AuditEntry {
  *   - "on_demand": the user (or an API caller) created the run directly (Phase A).
  *   - "schedule": the run was created by the cron scheduler (Phase B) on behalf
  *     of a standing AutoSchedule.
+ *   - "webhook": the run was created by an inbound webhook fire (Phase C) on
+ *     behalf of a standing AutoWebhook. Also carries `webhookId`.
  *
  * Defaults to "on_demand" for back-compat with pre-Phase-B run records that
  * carry neither `trigger` nor `scheduleId`.
  */
-export type RunTrigger = "on_demand" | "schedule";
+export type RunTrigger = "on_demand" | "schedule" | "webhook";
 
 /** The persisted record of one autonomous run. */
 export interface AutoRun {
@@ -246,11 +312,20 @@ export interface AutoRun {
   cancelRequested?: boolean;
   /**
    * How this run was triggered. Defaults to "on_demand" when absent (Phase A
-   * back-compat). "schedule" runs also carry `scheduleId`.
+   * back-compat). "schedule" runs also carry `scheduleId`; "webhook" runs also
+   * carry `webhookId`.
    */
   trigger?: RunTrigger;
   /** The AutoSchedule that produced this run (set iff trigger === "schedule"). */
   scheduleId?: string;
+  /** The AutoWebhook that produced this run (set iff trigger === "webhook"). */
+  webhookId?: string;
+  /**
+   * Manifest of per-run input files staged out-of-band (Phase C). Hydrated into
+   * the workspace `inputs/` subdir by the worker before execution. Distinct from
+   * `input.files` (inline content seeded at workspace root).
+   */
+  inputFiles?: AutoRunInputFileRef[];
 }
 
 export interface CreateRunInput {
@@ -270,6 +345,10 @@ export interface CreateRunInput {
   trigger?: RunTrigger;
   /** The AutoSchedule that produced this run (only with trigger "schedule"). */
   scheduleId?: string;
+  /** The AutoWebhook that produced this run (only with trigger "webhook"). */
+  webhookId?: string;
+  /** Out-of-band staged input-file manifest (Phase C). Hydrated by the worker. */
+  inputFiles?: AutoRunInputFileRef[];
 }
 
 // ---------------------------------------------------------------------------
@@ -362,4 +441,80 @@ export interface UpdateScheduleInput {
   nextRunAt?: string;
   /** Always stamped by the caller. */
   updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks (Phase C — inbound event triggers)
+// ---------------------------------------------------------------------------
+
+/**
+ * A standing webhook trigger: an inbound HTTP fire (from a third-party service)
+ * creates one autonomous run of a kit, under an existing standing AutoApproval,
+ * bounded by a REQUIRED per-fire budget.
+ *
+ * SECRET HANDLING: the webhook is authenticated by a shared secret. We store
+ * ONLY a sha256 hex HASH of that secret (`secretHash`) — never the plaintext.
+ * The web layer generates a random secret at creation, shows it to the user
+ * ONCE, and persists only the hash. `consumeWebhook` verifies a presented
+ * secret with a constant-time compare against the stored hash.
+ *
+ * SAFETY: a webhook does NOT widen consent. Each fire is still gated by the
+ * referenced approval (the gate matches on (userId, kitRef) like an on-demand
+ * run) and `budgetCents <= approval.maxBudgetCents`.
+ */
+export const autoWebhookSchema = z.object({
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  kitRef: kitRefSchema,
+  /**
+   * The standing AutoApproval id this webhook runs under (denormalised for
+   * display + a fast existence check). The approval gate still matches on
+   * (userId, kitRef) at fire time, so a re-keyed approval continues to work.
+   */
+  approvalId: z.string().min(1),
+  /** REQUIRED per-fire budget in US cents. */
+  budgetCents: z.number().int().positive(),
+  /** Canonical model id for fired runs. */
+  model: z.string().min(1),
+  /** Inference billing mode hint for fired runs. Defaults to "managed". */
+  inferenceMode: z.enum(["managed", "byo"]).optional(),
+  /** Whether the webhook is active. Disabled webhooks never fire. */
+  enabled: z.boolean(),
+  /** sha256 HEX hash of the shared secret. The plaintext is NEVER stored. */
+  secretHash: z.string().min(1),
+  createdAt: z.string().min(1),
+  /** ISO of the last fire (null until first fire). */
+  lastFiredAt: z.string().min(1).nullable(),
+  /** Run id produced by the last fire (null until first successful dispatch). */
+  lastRunId: z.string().min(1).nullable(),
+  /** Last fire error (auth/skip/dispatch failure); null when the last fire was clean. */
+  lastError: z.string().min(1).nullable(),
+  /** Number of times this webhook has fired (created a run). */
+  fireCount: z.number().int().nonnegative(),
+});
+
+export type AutoWebhook = z.infer<typeof autoWebhookSchema>;
+
+export interface CreateWebhookInput {
+  userId: string;
+  kitRef: KitRef;
+  approvalId: string;
+  budgetCents: number;
+  model: string;
+  inferenceMode?: InferenceMode;
+  /** Defaults to true (enabled) when omitted. */
+  enabled?: boolean;
+  /** sha256 hex of the secret. The web layer generates + hashes the plaintext. */
+  secretHash: string;
+  createdAt: string;
+}
+
+/** The fields recordFire stamps after a webhook successfully creates a run. */
+export interface WebhookFireResult {
+  /** When the webhook fired (ISO). */
+  lastFiredAt: string;
+  /** Run id produced by the fire. */
+  lastRunId: string;
+  /** Fire error, or null when the fire was clean. */
+  lastError: string | null;
 }

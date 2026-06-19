@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import type { AutoApprovalRepository } from "../src/core/ports.js";
 import type { AutoApproval, CreateApprovalInput, KitRef } from "../src/core/types.js";
-import { kitRefKey } from "../src/core/types.js";
+import { kitRefKey, normalizeNetworkPolicy } from "../src/core/types.js";
 
 export class InMemoryApprovalRepo implements AutoApprovalRepository {
   approvals = new Map<string, AutoApproval>();
@@ -15,7 +15,7 @@ export class InMemoryApprovalRepo implements AutoApprovalRepository {
       kitRef: input.kitRef,
       scope: input.scope ?? "workspace_read_write",
       toolAllowlist: input.toolAllowlist,
-      networkPolicy: input.networkPolicy ?? "deny_all",
+      networkPolicy: normalizeNetworkPolicy(input.networkPolicy),
       maxBudgetCents: input.maxBudgetCents,
       createdAt: input.createdAt,
       revokedAt: null,

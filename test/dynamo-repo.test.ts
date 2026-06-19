@@ -26,6 +26,7 @@ import {
   DynamoAutoRunRepository,
   DynamoAutoApprovalRepository,
   DynamoAutoScheduleRepository,
+  DynamoAutoWebhookRepository,
 } from "../src/adapters/aws/index.js";
 import { runRepositoryContract } from "./repository-contract.js";
 
@@ -39,6 +40,7 @@ if (!endpoint) {
   const RUNS = "AutoRuns-test";
   const APPROVALS = "AutoApprovals-test";
   const SCHEDULES = "AutoSchedules-test";
+  const WEBHOOKS = "AutoWebhooks-test";
 
   const raw = new DynamoDBClient({
     endpoint,
@@ -114,6 +116,23 @@ if (!endpoint) {
     ],
   };
 
+  const webhooksTable: CreateTableCommandInput = {
+    TableName: WEBHOOKS,
+    BillingMode: "PAY_PER_REQUEST",
+    AttributeDefinitions: [
+      { AttributeName: "id", AttributeType: "S" },
+      { AttributeName: "gsiUserId", AttributeType: "S" },
+    ],
+    KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: "userId-index",
+        KeySchema: [{ AttributeName: "gsiUserId", KeyType: "HASH" }],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
+  };
+
   const drop = async (name: string): Promise<void> => {
     const { TableNames } = await raw.send(new ListTablesCommand({}));
     if (TableNames?.includes(name)) await raw.send(new DeleteTableCommand({ TableName: name }));
@@ -124,14 +143,17 @@ if (!endpoint) {
       await drop(RUNS);
       await drop(APPROVALS);
       await drop(SCHEDULES);
+      await drop(WEBHOOKS);
       await raw.send(new CreateTableCommand(runsTable));
       await raw.send(new CreateTableCommand(approvalsTable));
       await raw.send(new CreateTableCommand(schedulesTable));
+      await raw.send(new CreateTableCommand(webhooksTable));
     };
     return {
       runs: new DynamoAutoRunRepository(db, RUNS),
       approvals: new DynamoAutoApprovalRepository(db, APPROVALS),
       schedules: new DynamoAutoScheduleRepository(db, SCHEDULES),
+      webhooks: new DynamoAutoWebhookRepository(db, WEBHOOKS),
       reset,
     };
   });

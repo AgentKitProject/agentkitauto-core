@@ -35,11 +35,14 @@ import {
   UpdateCommand,
   QueryCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { S3Client, type S3ClientConfig } from "@aws-sdk/client-s3";
 import type {
   AutoApprovalRepository,
   AutoRunRepository,
   AutoScheduleRepository,
   AutoStorageDeps,
+  AutoWebhookRepository,
+  InputStore,
   ScheduleRunResult,
 } from "../../core/ports.js";
 import type {
@@ -49,14 +52,20 @@ import type {
   AutoRunResult,
   AutoRunStatus,
   AutoSchedule,
+  AutoWebhook,
   CreateApprovalInput,
   CreateRunInput,
   CreateScheduleInput,
+  CreateWebhookInput,
   KitRef,
+  NetworkPolicy,
   UpdateScheduleInput,
+  WebhookFireResult,
 } from "../../core/types.js";
-import { kitRefKey } from "../../core/types.js";
+import { kitRefKey, normalizeNetworkPolicy } from "../../core/types.js";
 import { FsWorkspaceStore } from "../../core/fs-workspace.js";
+import { LocalInputStore } from "../../core/input-store.js";
+import { S3InputStore } from "./s3-input-store.js";
 
 // ---------------------------------------------------------------------------
 // Client factory (FORGE_AWS_* explicit creds, like gateway-core / forge-web)
@@ -65,6 +74,25 @@ import { FsWorkspaceStore } from "../../core/fs-workspace.js";
 export function awsClientEnv(
   env: Record<string, string | undefined> = process.env,
 ): DynamoDBClientConfig {
+  const region = env["FORGE_AWS_REGION"] || env["AWS_REGION"] || "us-east-1";
+  const accessKeyId = env["FORGE_AWS_ACCESS_KEY_ID"];
+  const secretAccessKey = env["FORGE_AWS_SECRET_ACCESS_KEY"];
+  return {
+    region,
+    ...(accessKeyId && secretAccessKey
+      ? { credentials: { accessKeyId, secretAccessKey } }
+      : {}),
+  };
+}
+
+/**
+ * Same FORGE_AWS_* explicit-creds resolution as {@link awsClientEnv}, typed for
+ * the S3 client (the SDK rejects a cross-client config type even though the
+ * region/credentials shape is identical). Used for the Phase C inputs bucket.
+ */
+export function s3ClientEnv(
+  env: Record<string, string | undefined> = process.env,
+): S3ClientConfig {
   const region = env["FORGE_AWS_REGION"] || env["AWS_REGION"] || "us-east-1";
   const accessKeyId = env["FORGE_AWS_ACCESS_KEY_ID"];
   const secretAccessKey = env["FORGE_AWS_SECRET_ACCESS_KEY"];
@@ -89,12 +117,14 @@ export interface AutoDynamoTableNames {
   runs: string;
   approvals: string;
   schedules: string;
+  webhooks: string;
 }
 
 export const AUTO_TABLE_ENV_VARS = {
   runs: "AUTO_RUNS_TABLE",
   approvals: "AUTO_APPROVALS_TABLE",
   schedules: "AUTO_SCHEDULES_TABLE",
+  webhooks: "AUTO_WEBHOOKS_TABLE",
 } as const;
 
 export function loadAutoDynamoTableNames(
@@ -111,6 +141,7 @@ export function loadAutoDynamoTableNames(
     runs: resolve(AUTO_TABLE_ENV_VARS.runs),
     approvals: resolve(AUTO_TABLE_ENV_VARS.approvals),
     schedules: resolve(AUTO_TABLE_ENV_VARS.schedules),
+    webhooks: resolve(AUTO_TABLE_ENV_VARS.webhooks),
   };
 }
 
@@ -146,6 +177,8 @@ export class DynamoAutoRunRepository implements AutoRunRepository {
       cancelRequested: false,
       trigger: input.trigger ?? "on_demand",
       ...(input.scheduleId !== undefined ? { scheduleId: input.scheduleId } : {}),
+      ...(input.webhookId !== undefined ? { webhookId: input.webhookId } : {}),
+      ...(input.inputFiles !== undefined ? { inputFiles: input.inputFiles } : {}),
     };
     await this.db.send(
       new PutCommand({
@@ -282,7 +315,7 @@ export class DynamoAutoApprovalRepository implements AutoApprovalRepository {
       kitRef: input.kitRef,
       scope: input.scope ?? "workspace_read_write",
       toolAllowlist: input.toolAllowlist,
-      networkPolicy: input.networkPolicy ?? "deny_all",
+      networkPolicy: normalizeNetworkPolicy(input.networkPolicy),
       maxBudgetCents: input.maxBudgetCents,
       createdAt: input.createdAt,
       revokedAt: null,
@@ -344,6 +377,11 @@ function stripApprovalGsi(item: Record<string, unknown>): AutoApproval {
     gsiUserId?: string;
     gsiUserKitKey?: string;
   };
+  // Normalize legacy/persisted networkPolicy (a bare "deny_all" string from
+  // pre-Phase-C rows) into the Phase C object shape.
+  (rest as { networkPolicy?: NetworkPolicy }).networkPolicy = normalizeNetworkPolicy(
+    (rest as { networkPolicy?: unknown }).networkPolicy,
+  );
   return rest as unknown as AutoApproval;
 }
 
@@ -506,6 +544,112 @@ function stripScheduleGsi(item: Record<string, unknown>): AutoSchedule {
 }
 
 // ---------------------------------------------------------------------------
+// DynamoDB AutoWebhookRepository (Phase C)
+// ---------------------------------------------------------------------------
+
+/**
+ * Table `AutoWebhooks`, PK `id`.
+ *   - GSI `userId-index` (PK gsiUserId) — listWebhooksByUser.
+ * Stores ONLY the secret HASH (never the plaintext). fireCount is incremented
+ * atomically via an ADD on recordFire.
+ */
+export class DynamoAutoWebhookRepository implements AutoWebhookRepository {
+  constructor(
+    private readonly db: DynamoDBDocumentClient,
+    private readonly tableName: string,
+  ) {}
+
+  async createWebhook(input: CreateWebhookInput): Promise<AutoWebhook> {
+    const webhook: AutoWebhook = {
+      id: randomUUID(),
+      userId: input.userId,
+      kitRef: input.kitRef,
+      approvalId: input.approvalId,
+      budgetCents: input.budgetCents,
+      model: input.model,
+      ...(input.inferenceMode !== undefined ? { inferenceMode: input.inferenceMode } : {}),
+      enabled: input.enabled ?? true,
+      secretHash: input.secretHash,
+      createdAt: input.createdAt,
+      lastFiredAt: null,
+      lastRunId: null,
+      lastError: null,
+      fireCount: 0,
+    };
+    await this.db.send(
+      new PutCommand({
+        TableName: this.tableName,
+        Item: { ...webhook, gsiUserId: input.userId },
+      }),
+    );
+    return webhook;
+  }
+
+  async getWebhook(webhookId: string): Promise<AutoWebhook | undefined> {
+    const result = await this.db.send(
+      new GetCommand({ TableName: this.tableName, Key: { id: webhookId } }),
+    );
+    return result.Item ? stripWebhookGsi(result.Item) : undefined;
+  }
+
+  async listWebhooksByUser(userId: string): Promise<AutoWebhook[]> {
+    const result = await this.db.send(
+      new QueryCommand({
+        TableName: this.tableName,
+        IndexName: "userId-index",
+        KeyConditionExpression: "gsiUserId = :u",
+        ExpressionAttributeValues: { ":u": userId },
+      }),
+    );
+    return (result.Items ?? []).map(stripWebhookGsi);
+  }
+
+  async recordFire(webhookId: string, result: WebhookFireResult): Promise<void> {
+    await this.db.send(
+      new UpdateCommand({
+        TableName: this.tableName,
+        Key: { id: webhookId },
+        UpdateExpression:
+          "SET lastFiredAt = :lfa, lastRunId = :lri, lastError = :le ADD fireCount :one",
+        ExpressionAttributeValues: {
+          ":lfa": result.lastFiredAt,
+          ":lri": result.lastRunId,
+          ":le": result.lastError,
+          ":one": 1,
+        },
+      }),
+    );
+  }
+
+  async setEnabled(webhookId: string, enabled: boolean): Promise<AutoWebhook | undefined> {
+    const result = await this.db.send(
+      new UpdateCommand({
+        TableName: this.tableName,
+        Key: { id: webhookId },
+        UpdateExpression: "SET enabled = :e",
+        ExpressionAttributeValues: { ":e": enabled },
+        ReturnValues: "ALL_NEW",
+      }),
+    );
+    return result.Attributes ? stripWebhookGsi(result.Attributes) : undefined;
+  }
+
+  async deleteWebhook(webhookId: string): Promise<void> {
+    await this.db.send(
+      new DeleteCommand({ TableName: this.tableName, Key: { id: webhookId } }),
+    );
+  }
+}
+
+function stripWebhookGsi(item: Record<string, unknown>): AutoWebhook {
+  const { gsiUserId: _u, ...rest } = item as Record<string, unknown> & { gsiUserId?: string };
+  const w = rest as unknown as AutoWebhook;
+  // Dynamo ADD on a missing attribute starts at the delta; defend fireCount.
+  w.fireCount = Number(w.fireCount ?? 0);
+  return w;
+}
+
+// ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
 
@@ -514,6 +658,14 @@ export interface MakeAwsAutoDepsOptions {
   db?: DynamoDBDocumentClient;
   /** Workspace root; defaults to an OS tmp dir. */
   workspaceRootDir?: string;
+  /**
+   * S3 bucket for Phase C staged input files (`auto-inputs/{runId}/...`). When
+   * set, an S3InputStore is used; otherwise a LocalInputStore (suitable for dev
+   * / tests). Defaults to AUTO_INPUTS_BUCKET when unset.
+   */
+  inputsBucket?: string;
+  /** Optional S3 client (defaults to one built from awsClientEnv). */
+  s3Client?: S3Client;
 }
 
 /** Builds the AWS-backed storage deps. */
@@ -521,10 +673,19 @@ export function makeAwsAutoDeps(options: MakeAwsAutoDepsOptions = {}): AutoStora
   const tables = options.tables ?? loadAutoDynamoTableNames();
   const db = options.db ?? createDynamoDBDocumentClient();
   const rootDir = options.workspaceRootDir ?? nodePath.join(os.tmpdir(), "agentkitauto-workspaces");
+  const inputsBucket = options.inputsBucket ?? process.env["AUTO_INPUTS_BUCKET"];
+  const inputs: InputStore = inputsBucket
+    ? new S3InputStore({
+        client: options.s3Client ?? new S3Client(s3ClientEnv()),
+        bucket: inputsBucket,
+      })
+    : new LocalInputStore();
   return {
     runs: new DynamoAutoRunRepository(db, tables.runs),
     approvals: new DynamoAutoApprovalRepository(db, tables.approvals),
     schedules: new DynamoAutoScheduleRepository(db, tables.schedules),
+    webhooks: new DynamoAutoWebhookRepository(db, tables.webhooks),
     workspaces: new FsWorkspaceStore({ rootDir }),
+    inputs,
   };
 }

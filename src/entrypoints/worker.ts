@@ -78,7 +78,7 @@ export async function processAutoRun(
   deps: ProcessAutoRunDeps,
 ): Promise<RunAutoRunResult> {
   const { storage, now } = deps;
-  const { runs, approvals, workspaces } = storage;
+  const { runs, approvals, workspaces, inputs } = storage;
 
   const run = await runs.getRun(runId);
   if (!run) throw new Error(`Auto run not found: ${runId}`);
@@ -119,9 +119,17 @@ export async function processAutoRun(
   const runWithWs: AutoRun = { ...run, status: "running", workspaceId };
 
   try {
-    // Seed input files into the workspace.
+    // Seed inline input files into the workspace root (Phase A).
     for (const f of run.input.files ?? []) {
       await workspaces.writeFile(workspaceId, f.path, f.content);
+    }
+
+    // Hydrate out-of-band staged input files into the workspace `inputs/` subdir
+    // (Phase C). Path-confined by the InputStore + WorkspaceStore. A staged file
+    // that is missing/unreadable is skipped by the store (best-effort), so a
+    // partial manifest never aborts the run.
+    if (run.inputFiles && run.inputFiles.length > 0) {
+      await inputs.hydrateInputsIntoWorkspace(run.id, workspaces, workspaceId, run.inputFiles);
     }
 
     const executeTool = makeSandboxExecutor({

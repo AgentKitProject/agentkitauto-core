@@ -19,6 +19,8 @@ import type {
   AutoRunRepository,
   AutoScheduleRepository,
   AutoStorageDeps,
+  AutoWebhookRepository,
+  InputStore,
   ScheduleRunResult,
 } from "../../core/ports.js";
 import type {
@@ -26,17 +28,22 @@ import type {
   AutoApproval,
   AutoRun,
   AutoRunInput,
+  AutoRunInputFileRef,
   AutoRunResult,
   AutoRunStatus,
   AutoSchedule,
+  AutoWebhook,
   CreateApprovalInput,
   CreateRunInput,
   CreateScheduleInput,
+  CreateWebhookInput,
   KitRef,
   UpdateScheduleInput,
+  WebhookFireResult,
 } from "../../core/types.js";
-import { kitRefKey } from "../../core/types.js";
+import { kitRefKey, normalizeNetworkPolicy } from "../../core/types.js";
 import { FsWorkspaceStore } from "../../core/fs-workspace.js";
+import { LocalInputStore } from "../../core/input-store.js";
 
 export interface PgPool {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -73,6 +80,8 @@ function rowToRun(row: Record<string, unknown>): AutoRun {
     trigger: (row["trigger"] as AutoRun["trigger"]) ?? "on_demand",
   };
   if (row["schedule_id"]) run.scheduleId = row["schedule_id"] as string;
+  if (row["webhook_id"]) run.webhookId = row["webhook_id"] as string;
+  if (row["input_files"]) run.inputFiles = asJson<AutoRunInputFileRef[]>(row["input_files"]);
   if (row["started_at"]) run.startedAt = row["started_at"] as string;
   if (row["finished_at"]) run.finishedAt = row["finished_at"] as string;
   if (row["error"]) run.error = row["error"] as string;
@@ -88,7 +97,9 @@ function rowToApproval(row: Record<string, unknown>): AutoApproval {
     kitRef: asJson<KitRef>(row["kit_ref"]),
     scope: row["scope"] as AutoApproval["scope"],
     toolAllowlist: asJson<string[]>(row["tool_allowlist"]),
-    networkPolicy: row["network_policy"] as AutoApproval["networkPolicy"],
+    // network_policy is stored as JSONB (Phase C); legacy rows may hold the bare
+    // string "deny_all". normalizeNetworkPolicy handles both → object shape.
+    networkPolicy: normalizeNetworkPolicy(asJson<unknown>(row["network_policy"])),
     maxBudgetCents: Number(row["max_budget_cents"]),
     createdAt: row["created_at"] as string,
     revokedAt: (row["revoked_at"] as string | null) ?? null,
@@ -109,8 +120,8 @@ export class PostgresAutoRunRepository implements AutoRunRepository {
          (id, user_id, kit_ref, status, input, budget_cents, spent_cents,
           spent_inference_cents, spent_compute_cents, inference_mode,
           is_cloud_run, cloud_run_cents_per_min, model, created_at, audit_log, cancel_requested,
-          trigger, schedule_id)
-       VALUES ($1,$2,$3,'queued',$4,$5,0,0,0,$6,$7,$8,$9,$10,$11,FALSE,$12,$13)
+          trigger, schedule_id, webhook_id, input_files)
+       VALUES ($1,$2,$3,'queued',$4,$5,0,0,0,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15)
        RETURNING *`,
       [
         id,
@@ -126,6 +137,8 @@ export class PostgresAutoRunRepository implements AutoRunRepository {
         "[]",
         input.trigger ?? "on_demand",
         input.scheduleId ?? null,
+        input.webhookId ?? null,
+        input.inputFiles ? JSON.stringify(input.inputFiles) : null,
       ],
     );
     return rowToRun(rows[0]!);
@@ -242,7 +255,7 @@ export class PostgresAutoApprovalRepository implements AutoApprovalRepository {
         `${input.userId}#${kitRefKey(input.kitRef)}`,
         input.scope ?? "workspace_read_write",
         JSON.stringify(input.toolAllowlist),
-        input.networkPolicy ?? "deny_all",
+        JSON.stringify(normalizeNetworkPolicy(input.networkPolicy)),
         input.maxBudgetCents,
         input.createdAt,
       ],
@@ -400,6 +413,96 @@ export class PostgresAutoScheduleRepository implements AutoScheduleRepository {
 }
 
 // ---------------------------------------------------------------------------
+// Postgres AutoWebhookRepository (Phase C)
+// ---------------------------------------------------------------------------
+
+function rowToWebhook(row: Record<string, unknown>): AutoWebhook {
+  const webhook: AutoWebhook = {
+    id: row["id"] as string,
+    userId: row["user_id"] as string,
+    kitRef: asJson<KitRef>(row["kit_ref"]),
+    approvalId: row["approval_id"] as string,
+    budgetCents: Number(row["budget_cents"]),
+    model: row["model"] as string,
+    enabled: row["enabled"] === true || row["enabled"] === "true",
+    secretHash: row["secret_hash"] as string,
+    createdAt: row["created_at"] as string,
+    lastFiredAt: (row["last_fired_at"] as string | null) ?? null,
+    lastRunId: (row["last_run_id"] as string | null) ?? null,
+    lastError: (row["last_error"] as string | null) ?? null,
+    fireCount: Number(row["fire_count"] ?? 0),
+  };
+  if (row["inference_mode"]) {
+    webhook.inferenceMode = row["inference_mode"] as AutoWebhook["inferenceMode"];
+  }
+  return webhook;
+}
+
+export class PostgresAutoWebhookRepository implements AutoWebhookRepository {
+  constructor(private readonly pool: PgPool) {}
+
+  async createWebhook(input: CreateWebhookInput): Promise<AutoWebhook> {
+    const id = randomUUID();
+    const { rows } = await this.pool.query(
+      `INSERT INTO auto_webhooks
+         (id, user_id, kit_ref, approval_id, budget_cents, model, inference_mode,
+          enabled, secret_hash, created_at, last_fired_at, last_run_id, last_error, fire_count)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,NULL,0)
+       RETURNING *`,
+      [
+        id,
+        input.userId,
+        JSON.stringify(input.kitRef),
+        input.approvalId,
+        input.budgetCents,
+        input.model,
+        input.inferenceMode ?? null,
+        input.enabled ?? true,
+        input.secretHash,
+        input.createdAt,
+      ],
+    );
+    return rowToWebhook(rows[0]!);
+  }
+
+  async getWebhook(webhookId: string): Promise<AutoWebhook | undefined> {
+    const { rows } = await this.pool.query("SELECT * FROM auto_webhooks WHERE id = $1", [
+      webhookId,
+    ]);
+    return rows[0] ? rowToWebhook(rows[0]) : undefined;
+  }
+
+  async listWebhooksByUser(userId: string): Promise<AutoWebhook[]> {
+    const { rows } = await this.pool.query(
+      "SELECT * FROM auto_webhooks WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId],
+    );
+    return rows.map(rowToWebhook);
+  }
+
+  async recordFire(webhookId: string, result: WebhookFireResult): Promise<void> {
+    await this.pool.query(
+      `UPDATE auto_webhooks
+         SET last_fired_at = $2, last_run_id = $3, last_error = $4, fire_count = fire_count + 1
+       WHERE id = $1`,
+      [webhookId, result.lastFiredAt, result.lastRunId, result.lastError],
+    );
+  }
+
+  async setEnabled(webhookId: string, enabled: boolean): Promise<AutoWebhook | undefined> {
+    const { rows } = await this.pool.query(
+      "UPDATE auto_webhooks SET enabled = $2 WHERE id = $1 RETURNING *",
+      [webhookId, enabled],
+    );
+    return rows[0] ? rowToWebhook(rows[0]) : undefined;
+  }
+
+  async deleteWebhook(webhookId: string): Promise<void> {
+    await this.pool.query("DELETE FROM auto_webhooks WHERE id = $1", [webhookId]);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Composition
 // ---------------------------------------------------------------------------
 
@@ -407,6 +510,12 @@ export interface MakeSelfHostAutoDepsOptions {
   pool: PgPool;
   /** Workspace root on a local disk / PV. Defaults to an OS tmp dir. */
   workspaceRootDir?: string;
+  /**
+   * Phase C input store. Defaults to an in-process LocalInputStore (suitable for
+   * single-node self-host where the web layer + worker share a process/disk). A
+   * MinIO/S3-backed store can be injected here for multi-node deployments.
+   */
+  inputs?: InputStore;
 }
 
 export function makeSelfHostAutoDeps(options: MakeSelfHostAutoDepsOptions): AutoStorageDeps {
@@ -416,6 +525,8 @@ export function makeSelfHostAutoDeps(options: MakeSelfHostAutoDepsOptions): Auto
     runs: new PostgresAutoRunRepository(options.pool),
     approvals: new PostgresAutoApprovalRepository(options.pool),
     schedules: new PostgresAutoScheduleRepository(options.pool),
+    webhooks: new PostgresAutoWebhookRepository(options.pool),
     workspaces: new FsWorkspaceStore({ rootDir }),
+    inputs: options.inputs ?? new LocalInputStore(),
   };
 }
