@@ -126,19 +126,21 @@ export const autoRunStatusSchema = z.enum([
 export type AutoRunStatus = z.infer<typeof autoRunStatusSchema>;
 
 /** A per-run input file the user supplies (seeded into the workspace). */
-export interface AutoRunInputFile {
+export const autoRunInputFileSchema = z.object({
   /** Workspace-relative path. */
-  path: string;
+  path: z.string().min(1),
   /** UTF-8 file contents. */
-  content: string;
-}
+  content: z.string(),
+});
+export type AutoRunInputFile = z.infer<typeof autoRunInputFileSchema>;
 
-export interface AutoRunInput {
+export const autoRunInputSchema = z.object({
   /** User-provided per-run instruction string (the task). */
-  prompt: string;
+  prompt: z.string(),
   /** Optional files seeded into the run workspace before execution. */
-  files?: AutoRunInputFile[];
-}
+  files: z.array(autoRunInputFileSchema).optional(),
+});
+export type AutoRunInput = z.infer<typeof autoRunInputSchema>;
 
 /** One file produced by the run, surfaced in the result manifest. */
 export interface WorkspaceFileEntry {
@@ -179,6 +181,17 @@ export interface AuditEntry {
   /** Optional short detail (error message / rejection reason). */
   detail?: string;
 }
+
+/**
+ * How a run was triggered.
+ *   - "on_demand": the user (or an API caller) created the run directly (Phase A).
+ *   - "schedule": the run was created by the cron scheduler (Phase B) on behalf
+ *     of a standing AutoSchedule.
+ *
+ * Defaults to "on_demand" for back-compat with pre-Phase-B run records that
+ * carry neither `trigger` nor `scheduleId`.
+ */
+export type RunTrigger = "on_demand" | "schedule";
 
 /** The persisted record of one autonomous run. */
 export interface AutoRun {
@@ -231,6 +244,13 @@ export interface AutoRun {
   workspaceId?: string;
   /** True when a kill-switch cancel was requested for this run. */
   cancelRequested?: boolean;
+  /**
+   * How this run was triggered. Defaults to "on_demand" when absent (Phase A
+   * back-compat). "schedule" runs also carry `scheduleId`.
+   */
+  trigger?: RunTrigger;
+  /** The AutoSchedule that produced this run (set iff trigger === "schedule"). */
+  scheduleId?: string;
 }
 
 export interface CreateRunInput {
@@ -246,4 +266,100 @@ export interface CreateRunInput {
   isCloudRun?: boolean;
   /** Per-minute cloud-run compute fee (cents); only billed on BYO + cloud runs. */
   cloudRunCentsPerMin?: number;
+  /** How this run was triggered. Defaults to "on_demand" when omitted. */
+  trigger?: RunTrigger;
+  /** The AutoSchedule that produced this run (only with trigger "schedule"). */
+  scheduleId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Schedules (Phase B — scheduled / cron Auto runs)
+// ---------------------------------------------------------------------------
+
+/**
+ * A standing schedule: fires an autonomous run of a kit on a recurring cron
+ * cadence, under an existing standing AutoApproval, bounded by a REQUIRED
+ * per-run budget. The scheduler (schedule-runner) creates one AutoRun per fire
+ * with `trigger: "schedule"` and `scheduleId` set, reusing the exact Phase A
+ * approval gate + run-create + dispatch path (injected, never hard-depended on).
+ *
+ * SAFETY: a schedule does NOT widen consent. Each fire is still gated by the
+ * referenced approval (`approvalId` is advisory/denormalised; the gate matches
+ * on (userId, kitRef) like an on-demand run) and `budgetCents <=
+ * approval.maxBudgetCents`.
+ */
+export const autoScheduleSchema = z.object({
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  kitRef: kitRefSchema,
+  /** Standard 5-field cron expression (minute hour dom month dow). */
+  cron: z.string().min(1),
+  /** IANA timezone the cron is evaluated in. Defaults to "UTC". */
+  timezone: z.string().min(1),
+  /** The per-run task input (same shape Phase A runs use). */
+  input: autoRunInputSchema,
+  /** REQUIRED per-run budget in US cents. */
+  budgetCents: z.number().int().positive(),
+  /** Canonical model id for fired runs. */
+  model: z.string().min(1),
+  /**
+   * The standing AutoApproval id this schedule runs under (denormalised for
+   * display + a fast existence check). The approval gate still matches on
+   * (userId, kitRef) at fire time, so a re-keyed approval continues to work.
+   */
+  approvalId: z.string().min(1),
+  /** Inference billing mode hint for fired runs. Defaults to "managed". */
+  inferenceMode: z.enum(["managed", "byo"]).optional(),
+  /** Whether the schedule is active. Disabled schedules never fire. */
+  enabled: z.boolean(),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  /** ISO of the last fire (null until first fire). */
+  lastRunAt: z.string().min(1).nullable(),
+  /** Run id produced by the last fire (null until first successful dispatch). */
+  lastRunId: z.string().min(1).nullable(),
+  /** Computed ISO of the NEXT scheduled fire (the due-selection key). */
+  nextRunAt: z.string().min(1),
+  /** Last fire error (skip reason / dispatch failure); null when last fire was clean. */
+  lastError: z.string().min(1).nullable(),
+});
+
+export type AutoSchedule = z.infer<typeof autoScheduleSchema>;
+
+export interface CreateScheduleInput {
+  userId: string;
+  kitRef: KitRef;
+  cron: string;
+  /** IANA timezone. Defaults to "UTC" when omitted. */
+  timezone?: string;
+  input: AutoRunInput;
+  budgetCents: number;
+  model: string;
+  approvalId: string;
+  inferenceMode?: InferenceMode;
+  /** Defaults to true (enabled) when omitted. */
+  enabled?: boolean;
+  createdAt: string;
+  /**
+   * The first nextRunAt, computed by the caller via nextFireAfter(cron,
+   * createdAt, timezone). The adapter persists it verbatim so the scheduler can
+   * select due rows without re-parsing cron on write.
+   */
+  nextRunAt: string;
+}
+
+/** Fields an updateSchedule call may change (enable/disable/edit). */
+export interface UpdateScheduleInput {
+  cron?: string;
+  timezone?: string;
+  input?: AutoRunInput;
+  budgetCents?: number;
+  model?: string;
+  approvalId?: string;
+  inferenceMode?: InferenceMode;
+  enabled?: boolean;
+  /** Recomputed when cron/timezone/enabled change; caller supplies the new value. */
+  nextRunAt?: string;
+  /** Always stamped by the caller. */
+  updatedAt: string;
 }

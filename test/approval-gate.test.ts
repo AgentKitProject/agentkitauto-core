@@ -26,6 +26,7 @@ import {
   textResponse,
 } from "./fakes.js";
 import { InMemoryApprovalRepo } from "./approval-repo-fake.js";
+import { InMemoryScheduleRepo } from "./schedule-repo-fake.js";
 
 class FundedLedger implements CreditLedgerRepository {
   async getAccount() {
@@ -70,7 +71,8 @@ async function harness() {
   const runs = new InMemoryRunRepo();
   const approvals = new InMemoryApprovalRepo();
   const workspaces = new InMemoryWorkspace();
-  const storage: AutoStorageDeps = { runs, approvals, workspaces };
+  const schedules = new InMemoryScheduleRepo();
+  const storage: AutoStorageDeps = { runs, approvals, workspaces, schedules };
   const deps = {
     storage,
     chatProvider: new FakeChatProvider([textResponse("done")]),

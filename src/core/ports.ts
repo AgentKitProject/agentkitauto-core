@@ -21,9 +21,12 @@ import type {
   AutoRun,
   AutoRunResult,
   AutoRunStatus,
+  AutoSchedule,
   CreateApprovalInput,
   CreateRunInput,
+  CreateScheduleInput,
   KitRef,
+  UpdateScheduleInput,
   WorkspaceFileEntry,
 } from "./types.js";
 
@@ -90,6 +93,47 @@ export interface AutoApprovalRepository {
 }
 
 // ---------------------------------------------------------------------------
+// AutoScheduleRepository (Phase B)
+// ---------------------------------------------------------------------------
+
+/** The result fields the scheduler stamps after firing (or skipping) a schedule. */
+export interface ScheduleRunResult {
+  /** When the schedule was processed this sweep (ISO). */
+  lastRunAt: string;
+  /** Run id produced by the fire, or null when the fire was skipped. */
+  lastRunId: string | null;
+  /** The recomputed next fire time (ISO) — always advanced to avoid hot-loops. */
+  nextRunAt: string;
+  /** Skip reason / dispatch error, or null when the fire was clean. */
+  lastError: string | null;
+}
+
+/**
+ * Persists standing schedules (Phase B).
+ *
+ * INVARIANTS:
+ *   - listDueSchedules returns ENABLED schedules whose nextRunAt <= now.
+ *   - setScheduleRunResult always advances nextRunAt (the scheduler computes the
+ *     next fire BEFORE dispatch and persists it) so a re-entrant sweep within
+ *     the same minute cannot double-fire.
+ */
+export interface AutoScheduleRepository {
+  createSchedule(input: CreateScheduleInput): Promise<AutoSchedule>;
+  getSchedule(scheduleId: string): Promise<AutoSchedule | undefined>;
+  listSchedulesByUser(userId: string): Promise<AutoSchedule[]>;
+  /** Enabled schedules due to fire (nextRunAt <= nowISO). */
+  listDueSchedules(nowISO: string): Promise<AutoSchedule[]>;
+  /** Edits a schedule (enable/disable/edit); returns the updated row or undefined. */
+  updateSchedule(
+    scheduleId: string,
+    patch: UpdateScheduleInput,
+  ): Promise<AutoSchedule | undefined>;
+  /** Records the outcome of a fire/skip (lastRunAt/lastRunId/nextRunAt/lastError). */
+  setScheduleRunResult(scheduleId: string, result: ScheduleRunResult): Promise<void>;
+  deleteSchedule(scheduleId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
 // WorkspaceStore (the "hands" substrate)
 // ---------------------------------------------------------------------------
 
@@ -123,4 +167,6 @@ export interface AutoStorageDeps {
   runs: AutoRunRepository;
   approvals: AutoApprovalRepository;
   workspaces: WorkspaceStore;
+  /** Phase B: standing schedules. */
+  schedules: AutoScheduleRepository;
 }
