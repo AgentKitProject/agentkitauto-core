@@ -1,0 +1,51 @@
+{
+  "name": "@agentkitforge/auto-core",
+  "version": "0.0.1",
+  "description": "AgentKitAuto core engine (Phase A): on-demand, fire-and-forget, run-to-completion autonomous Agent Kit runs. Reuses the @agentkitforge/gateway-core engine (managed-turn billing + pricing) and adds a non-interactive policy-gated sandbox executor as the hands, standing approvals, per-run budget caps, kill-switch, lifecycle + audit, and AWS + self-host adapters.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./entrypoints/worker": {
+      "types": "./dist/entrypoints/worker.d.ts",
+      "default": "./dist/entrypoints/worker.js"
+    },
+    "./entrypoints/run-task": {
+      "types": "./dist/entrypoints/run-task.d.ts",
+      "default": "./dist/entrypoints/run-task.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && npm run copy-sql",
+    "copy-sql": "cp src/adapters/selfhost/schema.sql dist/adapters/selfhost/schema.sql",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@agentkitforge/gateway-core": "github:AgentKitProject/agentkitgateway-core",
+    "@aws-sdk/client-dynamodb": "^3.1068.0",
+    "@aws-sdk/client-s3": "^3.1068.0",
+    "@aws-sdk/lib-dynamodb": "^3.1068.0",
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/pg": "^8.11.10",
+    "pg-mem": "^3.0.5",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

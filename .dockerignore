@@ -1,0 +1,16 @@
+# Hygiene for an auto-core-rooted build context. NOTE: the worker image is built
+# from the PARENT workspace dir (see Dockerfile header), so this file only takes
+# effect when the context is auto-core itself. The operator may want a matching
+# .dockerignore at the workspace root to keep the parent context small.
+node_modules
+dist
+.git
+.gitignore
+test
+*.md
+*.log
+coverage
+.DS_Store
+.vscode
+.idea
+npm-debug.log*
