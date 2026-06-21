@@ -35,6 +35,7 @@
     "@agentkitforge/gateway-core": "github:AgentKitProject/agentkitgateway-core",
     "@aws-sdk/client-dynamodb": "^3.1068.0",
     "@aws-sdk/client-s3": "^3.1068.0",
+    "@aws-sdk/client-sesv2": "^3.1073.0",
     "@aws-sdk/lib-dynamodb": "^3.1068.0",
     "pg": "^8.13.1",
     "zod": "^3.24.1"

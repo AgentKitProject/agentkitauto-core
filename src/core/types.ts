@@ -143,6 +143,92 @@ export interface CreateApprovalInput {
 }
 
 // ---------------------------------------------------------------------------
+// Delivery (Phase D — opt-in result delivery)
+// ---------------------------------------------------------------------------
+
+/**
+ * Opt-in result delivery for a run (Phase D). When a run reaches a TERMINAL
+ * status (success OR failure), the worker delivers a notification through each
+ * configured channel. Delivery is best-effort: a delivery failure NEVER fails
+ * the run — it is logged + audited only.
+ *
+ *   - `email`: a list of recipient addresses (basic-format validated). Delivered
+ *     via the injected `EmailSender` port (SES on AWS; no-op self-host until SMTP
+ *     is wired). If SES_SENDER is unset on the aws adapter, email is an inert
+ *     no-op so missing config never breaks a run.
+ *   - `webhook`: an https endpoint the user owns. A signed JSON POST is sent to
+ *     `url`; when `secret` is present the body is HMAC-SHA256 signed and the hex
+ *     digest is sent as `X-AutoDelivery-Signature: sha256=<hmac>`. The
+ *     destination is SSRF-guarded exactly like the http_fetch tool (https-only,
+ *     DNS-resolved, private/loopback/link-local/metadata ranges rejected) — the
+ *     guard, NOT an allowlist, is the protection (the url is the user's own).
+ *
+ * Both channels are optional; absent `deliveryConfig` (or an empty object) means
+ * NO delivery. Backward compatible: pre-Phase-D records carry no deliveryConfig.
+ */
+export const deliveryWebhookSchema = z.object({
+  /** Destination URL. MUST be https (validated). */
+  url: z.string().url(),
+  /** Optional HMAC-SHA256 signing secret. Absent → the payload is sent unsigned. */
+  secret: z.string().min(1).optional(),
+});
+export type DeliveryWebhook = z.infer<typeof deliveryWebhookSchema>;
+
+export const deliveryConfigSchema = z
+  .object({
+    /** Recipient email addresses (basic-format validated). */
+    email: z.array(z.string().email()).optional(),
+    /** A signed-webhook destination. */
+    webhook: deliveryWebhookSchema.optional(),
+  })
+  .strict();
+export type DeliveryConfig = z.infer<typeof deliveryConfigSchema>;
+
+/** Per-channel delivery outcome status. */
+export type DeliveryChannelStatus = "delivered" | "failed" | "skipped";
+
+/** The outcome of one channel's delivery attempt. */
+export interface DeliveryChannelOutcome {
+  status: DeliveryChannelStatus;
+  /** Failure / skip detail (absent on a clean delivery). */
+  error?: string;
+}
+
+/** The aggregate per-channel result of `deliverResult`. */
+export interface DeliveryOutcome {
+  email?: DeliveryChannelOutcome;
+  webhook?: DeliveryChannelOutcome;
+}
+
+/**
+ * Validates a delivery config beyond the schema's structural checks:
+ *   - every email address is basic-format (the schema already enforces this);
+ *   - the webhook url, when present, is https (NOT just a valid URL).
+ * Returns the parsed config, or throws a descriptive Error. Treats `undefined`
+ * as "no delivery" (returns undefined).
+ */
+export function validateDeliveryConfig(value: unknown): DeliveryConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = deliveryConfigSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new Error(`Invalid deliveryConfig: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+  }
+  const config = parsed.data;
+  if (config.webhook) {
+    let url: URL;
+    try {
+      url = new URL(config.webhook.url);
+    } catch {
+      throw new Error(`Invalid deliveryConfig: webhook url is not a valid URL.`);
+    }
+    if (url.protocol !== "https:") {
+      throw new Error(`Invalid deliveryConfig: webhook url must be https (got ${url.protocol}).`);
+    }
+  }
+  return config;
+}
+
+// ---------------------------------------------------------------------------
 // Runs
 // ---------------------------------------------------------------------------
 
@@ -297,6 +383,13 @@ export interface AutoRun {
    * `input.files` (inline content seeded at workspace root).
    */
   inputFiles?: AutoRunInputFileRef[];
+  /**
+   * Opt-in result delivery (Phase D). When set, the worker delivers a
+   * notification through each configured channel after the run reaches a
+   * terminal status (success OR failure). Absent = no delivery. Best-effort: a
+   * delivery failure never fails the run.
+   */
+  deliveryConfig?: DeliveryConfig;
 }
 
 export interface CreateRunInput {
@@ -320,6 +413,8 @@ export interface CreateRunInput {
   webhookId?: string;
   /** Out-of-band staged input-file manifest (Phase C). Hydrated by the worker. */
   inputFiles?: AutoRunInputFileRef[];
+  /** Opt-in result delivery (Phase D). Absent = no delivery. */
+  deliveryConfig?: DeliveryConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +439,17 @@ export interface CreateRunInput {
  */
 export const autoScheduleSchema = contractsAutoScheduleSchema;
 
-export type AutoSchedule = z.infer<typeof autoScheduleSchema>;
+/**
+ * The standing-schedule record, extended (Phase D) with an OPTIONAL
+ * `deliveryConfig` carried alongside the contracts-derived shape. The config is
+ * COPIED onto every run a schedule fires (the web layer / createAndDispatch
+ * reads it and threads it into CreateRunInput). The contracts schema parses in
+ * "strip" mode, so an unknown `deliveryConfig` is tolerated on the wire; this
+ * type makes it first-class for consumers. Backward compatible (optional).
+ */
+export type AutoSchedule = z.infer<typeof autoScheduleSchema> & {
+  deliveryConfig?: DeliveryConfig;
+};
 
 export interface CreateScheduleInput {
   userId: string;
@@ -366,6 +471,8 @@ export interface CreateScheduleInput {
    * select due rows without re-parsing cron on write.
    */
   nextRunAt: string;
+  /** Opt-in result delivery (Phase D), copied onto each run this schedule fires. */
+  deliveryConfig?: DeliveryConfig;
 }
 
 /** Fields an updateSchedule call may change (enable/disable/edit). */
@@ -380,6 +487,8 @@ export interface UpdateScheduleInput {
   enabled?: boolean;
   /** Recomputed when cron/timezone/enabled change; caller supplies the new value. */
   nextRunAt?: string;
+  /** Opt-in result delivery (Phase D); pass to add/replace, null to clear. */
+  deliveryConfig?: DeliveryConfig | null;
   /** Always stamped by the caller. */
   updatedAt: string;
 }
@@ -409,7 +518,17 @@ export interface UpdateScheduleInput {
  */
 export const autoWebhookSchema = contractsAutoWebhookSchema;
 
-export type AutoWebhook = z.infer<typeof autoWebhookSchema>;
+/**
+ * The standing-webhook record, extended (Phase D) with an OPTIONAL
+ * `deliveryConfig` carried alongside the contracts-derived shape. The config is
+ * COPIED onto every run an inbound fire creates (the web layer /
+ * createAndDispatch reads it and threads it into CreateRunInput). The contracts
+ * schema parses in "strip" mode, so an unknown `deliveryConfig` is tolerated on
+ * the wire; this type makes it first-class for consumers. Backward compatible.
+ */
+export type AutoWebhook = z.infer<typeof autoWebhookSchema> & {
+  deliveryConfig?: DeliveryConfig;
+};
 
 export interface CreateWebhookInput {
   userId: string;
@@ -423,6 +542,8 @@ export interface CreateWebhookInput {
   /** sha256 hex of the secret. The web layer generates + hashes the plaintext. */
   secretHash: string;
   createdAt: string;
+  /** Opt-in result delivery (Phase D), copied onto each run an inbound fire creates. */
+  deliveryConfig?: DeliveryConfig;
 }
 
 /** The fields recordFire stamps after a webhook successfully creates a run. */
