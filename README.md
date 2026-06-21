@@ -108,6 +108,37 @@ Repository tests run dual-backend: the Postgres adapter against **pg-mem**
 (unconditional), the DynamoDB adapter against **dynamodb-local** (skipped unless
 `DYNAMODB_ENDPOINT` is set), mirroring gateway-core / market-core.
 
+## Self-hosted deployment — result delivery (email)
+
+Self-hosted Auto supports **SMTP email delivery** for run-result notifications
+(Phase D). Configure it via environment variables:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SMTP_HOST` | yes (to enable) | — | SMTP server hostname |
+| `SMTP_FROM` | yes (to enable) | — | Envelope / From address (must be authorized by the relay) |
+| `SMTP_PORT` | no | `587` | SMTP port |
+| `SMTP_SECURE` | no | `false` | `"true"` to use TLS from the start (port 465); otherwise STARTTLS |
+| `SMTP_USER` | no | — | SMTP auth username |
+| `SMTP_PASS` | no | — | SMTP auth password |
+
+**Inert when unconfigured:** if `SMTP_HOST` or `SMTP_FROM` is unset, the sender
+returns `{ status: "skipped" }` and logs a warning once — runs are never affected
+and webhook delivery continues to work. SMTP errors are caught and returned as
+`{ status: "failed" }`; they are non-fatal.
+
+Example (STARTTLS with authentication):
+```
+SMTP_HOST=smtp.mailrelay.example.com
+SMTP_PORT=587
+SMTP_USER=automailer@example.com
+SMTP_PASS=supersecret
+SMTP_FROM=auto-noreply@example.com
+```
+
+The hosted (AWS) backend uses SES (`SES_SENDER` env var) instead; the SMTP
+adapter is selfhost-only.
+
 ## Deferred to later phases
 
 - **Phase B — scheduling:** cron / recurring runs.
