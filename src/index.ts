@@ -19,27 +19,36 @@ export type {
   AutoRun,
   AutoRunInput,
   AutoRunInputFile,
+  AutoRunInputFileRef,
   AutoRunResult,
   AutoRunStatus,
   AutoSchedule,
+  AutoWebhook,
   CreateApprovalInput,
   CreateRunInput,
   CreateScheduleInput,
+  CreateWebhookInput,
   InferenceMode,
   KitRef,
   NetworkPolicy,
   RunTrigger,
   UpdateScheduleInput,
+  WebhookFireResult,
   WorkspaceFileEntry,
 } from "./core/types.js";
 export {
   autoApprovalSchema,
+  autoRunInputFileRefSchema,
   autoRunInputFileSchema,
   autoRunInputSchema,
   autoRunStatusSchema,
   autoScheduleSchema,
+  autoWebhookSchema,
+  DENY_ALL_NETWORK_POLICY,
   kitRefKey,
   kitRefSchema,
+  networkPolicySchema,
+  normalizeNetworkPolicy,
 } from "./core/types.js";
 
 // ---- Ports ---------------------------------------------------------------
@@ -48,8 +57,11 @@ export type {
   AutoRunRepository,
   AutoScheduleRepository,
   AutoStorageDeps,
+  AutoWebhookRepository,
   ConfigProvider,
+  InputStore,
   ScheduleRunResult,
+  StagedInputFile,
   WorkspaceStore,
 } from "./core/ports.js";
 
@@ -67,9 +79,46 @@ export type {
   ScheduleSweepSummary,
 } from "./core/schedule-runner.js";
 
+// ---- Webhook triggers (Phase C) ------------------------------------------
+export { consumeWebhook, WebhookError } from "./core/webhook-runner.js";
+export type {
+  ConsumeWebhookArgs,
+  CreateAndDispatchWebhookRun,
+  WebhookErrorReason,
+} from "./core/webhook-runner.js";
+export {
+  generateWebhookSecret,
+  hashWebhookSecret,
+  verifyWebhookSecret,
+} from "./core/webhook-secret.js";
+
+// ---- Network egress (Phase C http_fetch) ---------------------------------
+export {
+  guardedHttpFetch,
+  hostMatchesAllowlist,
+  isBlockedIp,
+  HttpFetchError,
+} from "./core/http-fetch.js";
+export type {
+  DnsResolver,
+  FetchFn,
+  HttpFetchArgs,
+  HttpFetchOptions,
+  HttpFetchResult,
+} from "./core/http-fetch.js";
+
+// ---- User-provided inputs (Phase C) --------------------------------------
+export {
+  confineInputPath,
+  INPUTS_SUBDIR,
+  InputPathError,
+  LocalInputStore,
+} from "./core/input-store.js";
+
 // ---- Sandbox executor (the hands) ---------------------------------------
 export {
   makeSandboxExecutor,
+  SANDBOX_FILE_TOOLS,
   SANDBOX_TOOLS,
 } from "./core/sandbox-executor.js";
 export type {
@@ -122,13 +171,17 @@ export {
   DynamoAutoApprovalRepository,
   DynamoAutoRunRepository,
   DynamoAutoScheduleRepository,
+  DynamoAutoWebhookRepository,
   loadAutoDynamoTableNames,
   makeAwsAutoDeps,
+  s3ClientEnv,
 } from "./adapters/aws/index.js";
 export type {
   AutoDynamoTableNames,
   MakeAwsAutoDepsOptions,
 } from "./adapters/aws/index.js";
+export { inputObjectKey, S3InputStore } from "./adapters/aws/s3-input-store.js";
+export type { S3InputStoreOptions } from "./adapters/aws/s3-input-store.js";
 
 // ---- Self-host adapter ---------------------------------------------------
 export {
@@ -136,6 +189,7 @@ export {
   PostgresAutoApprovalRepository,
   PostgresAutoRunRepository,
   PostgresAutoScheduleRepository,
+  PostgresAutoWebhookRepository,
 } from "./adapters/selfhost/postgres.js";
 export type {
   MakeSelfHostAutoDepsOptions,

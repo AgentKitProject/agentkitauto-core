@@ -25,7 +25,7 @@ const approval: AutoApproval = {
   kitRef: { source: "local", localKitId: "k1" },
   scope: "workspace_read_write",
   toolAllowlist: ["read_file", "list_dir", "write_file"],
-  networkPolicy: "deny_all",
+  networkPolicy: { mode: "deny_all" },
   maxBudgetCents: 1000,
   createdAt: noopNow(),
   revokedAt: null,
@@ -142,5 +142,113 @@ describe("makeSandboxExecutor", () => {
     const res = await exec({ toolUseId: "1", name: "write_file", input: { path: "a.txt", content: "x" } });
     expect("error" in res).toBe(true);
     expect((res as { error: string }).error).toMatch(/not declared/i);
+  });
+
+  // ---- http_fetch (Phase C network egress) ------------------------------
+  describe("http_fetch", () => {
+    const allowlistApproval: AutoApproval = {
+      ...approval,
+      toolAllowlist: ["read_file", "http_fetch"],
+      networkPolicy: { mode: "allowlist", hosts: ["api.example.com"] },
+    };
+    const publicResolver = async (): Promise<string[]> => ["93.184.216.34"];
+    const okFetch = async (): Promise<{
+      status: number;
+      headers: { forEach(cb: (v: string, k: string) => void): void };
+      text(): Promise<string>;
+    }> => ({
+      status: 200,
+      headers: { forEach: (cb) => cb("application/json", "content-type") },
+      text: async () => `{"ok":true}`,
+    });
+
+    const makeNetExec = (appr: AutoApproval, withNetwork = true) =>
+      makeSandboxExecutor({
+        workspace: store,
+        workspaceId,
+        runId: "run-1",
+        approval: appr,
+        repo,
+        resolvedTools: ["read_file", "http_fetch"],
+        now: noopNow,
+        ...(withNetwork ? { network: { fetchFn: okFetch, resolver: publicResolver } } : {}),
+      });
+
+    it("fetches an allowlisted host and audits ok", async () => {
+      const exec = makeNetExec(allowlistApproval);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://api.example.com/x" } });
+      expect("result" in res).toBe(true);
+      expect((res as { result: { status: number } }).result.status).toBe(200);
+      const run = await repo.getRun("run-1");
+      const entry = run?.auditLog[0];
+      expect(entry?.outcome).toBe("ok");
+      expect(entry?.tool).toBe("http_fetch");
+      // Audit summarizes host/url, never the body.
+      expect(entry?.argsSummary).toContain("host=api.example.com");
+    });
+
+    it("rejects a non-allowlisted host (audited rejected)", async () => {
+      const exec = makeNetExec(allowlistApproval);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://evil.com/" } });
+      expect("error" in res).toBe(true);
+      expect((res as { error: string }).error).toMatch(/allowlist/i);
+      const run = await repo.getRun("run-1");
+      expect(run?.auditLog[0]?.outcome).toBe("rejected");
+    });
+
+    it("rejects a non-https url", async () => {
+      const exec = makeNetExec(allowlistApproval);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "http://api.example.com/" } });
+      expect("error" in res).toBe(true);
+      expect((res as { error: string }).error).toMatch(/https/i);
+    });
+
+    it("rejects when the host resolves to a private IP (SSRF)", async () => {
+      const exec = makeSandboxExecutor({
+        workspace: store,
+        workspaceId,
+        runId: "run-1",
+        approval: allowlistApproval,
+        repo,
+        resolvedTools: ["read_file", "http_fetch"],
+        now: noopNow,
+        network: { fetchFn: okFetch, resolver: async () => ["169.254.169.254"] },
+      });
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://api.example.com/" } });
+      expect("error" in res).toBe(true);
+      expect((res as { error: string }).error).toMatch(/blocked address/i);
+    });
+
+    it("is unavailable when http_fetch is not opted into the approval allowlist", async () => {
+      // allowlist policy, but http_fetch NOT in the approval toolAllowlist.
+      const noOptIn: AutoApproval = {
+        ...approval,
+        toolAllowlist: ["read_file"],
+        networkPolicy: { mode: "allowlist", hosts: ["api.example.com"] },
+      };
+      const exec = makeNetExec(noOptIn);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://api.example.com/" } });
+      expect("error" in res).toBe(true);
+      // Rejected at the approval-allowlist gate.
+      expect((res as { error: string }).error).toMatch(/allowlist|unavailable/i);
+    });
+
+    it("is unavailable under a deny_all policy even if http_fetch is approved", async () => {
+      const denyApproval: AutoApproval = {
+        ...approval,
+        toolAllowlist: ["read_file", "http_fetch"],
+        networkPolicy: { mode: "deny_all" },
+      };
+      const exec = makeNetExec(denyApproval);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://api.example.com/" } });
+      expect("error" in res).toBe(true);
+      expect((res as { error: string }).error).toMatch(/deny_all|unavailable/i);
+    });
+
+    it("is unavailable when no network deps are injected (default-deny)", async () => {
+      const exec = makeNetExec(allowlistApproval, /* withNetwork */ false);
+      const res = await exec({ toolUseId: "1", name: "http_fetch", input: { url: "https://api.example.com/" } });
+      expect("error" in res).toBe(true);
+    });
   });
 });

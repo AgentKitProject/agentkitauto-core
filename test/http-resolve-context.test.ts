@@ -30,6 +30,8 @@ import {
 } from "./fakes.js";
 import { InMemoryApprovalRepo } from "./approval-repo-fake.js";
 import { InMemoryScheduleRepo } from "./schedule-repo-fake.js";
+import { InMemoryWebhookRepo } from "./webhook-repo-fake.js";
+import { LocalInputStore } from "../src/core/input-store.js";
 
 function okResponse(body: unknown): Response {
   return {
@@ -223,7 +225,9 @@ describe("toResolveKitContext drives processAutoRun", () => {
     const approvals = new InMemoryApprovalRepo();
     const workspaces = new InMemoryWorkspace();
     const schedules = new InMemoryScheduleRepo();
-    const storage: AutoStorageDeps = { runs, approvals, workspaces, schedules };
+    const webhooks = new InMemoryWebhookRepo();
+    const inputs = new LocalInputStore();
+    const storage: AutoStorageDeps = { runs, approvals, workspaces, schedules, webhooks, inputs };
 
     await approvals.createApproval({
       userId: "u1",

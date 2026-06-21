@@ -9,17 +9,21 @@ import type {
   AutoApprovalRepository,
   AutoRunRepository,
   AutoScheduleRepository,
+  AutoWebhookRepository,
 } from "../src/core/ports.js";
 import type {
   CreateRunInput,
   CreateApprovalInput,
   CreateScheduleInput,
+  CreateWebhookInput,
 } from "../src/core/types.js";
+import { hashWebhookSecret } from "../src/core/webhook-secret.js";
 
 export interface ContractRepos {
   runs: AutoRunRepository;
   approvals: AutoApprovalRepository;
   schedules: AutoScheduleRepository;
+  webhooks: AutoWebhookRepository;
   reset: () => Promise<void>;
 }
 
@@ -60,6 +64,19 @@ function scheduleInput(over: Partial<CreateScheduleInput> = {}): CreateScheduleI
     approvalId: "appr-1",
     createdAt: NOW,
     nextRunAt: "2026-06-18T00:05:00.000Z",
+    ...over,
+  };
+}
+
+function webhookInput(over: Partial<CreateWebhookInput> = {}): CreateWebhookInput {
+  return {
+    userId: "u1",
+    kitRef: { source: "local", localKitId: "k1" },
+    approvalId: "appr-1",
+    budgetCents: 200,
+    model: "claude-sonnet-4-6",
+    secretHash: hashWebhookSecret("the-secret"),
+    createdAt: NOW,
     ...over,
   };
 }
@@ -126,7 +143,7 @@ export function runRepositoryContract(label: string, makeRepos: () => Promise<Co
 
     it("creates an approval and finds it by kit (non-revoked only)", async () => {
       const created = await repos.approvals.createApproval(approvalInput());
-      expect(created.networkPolicy).toBe("deny_all");
+      expect(created.networkPolicy).toEqual({ mode: "deny_all" });
       expect(created.scope).toBe("workspace_read_write");
       const found = await repos.approvals.getApprovalForKit("u1", { source: "local", localKitId: "k1" });
       expect(found?.id).toBe(created.id);
@@ -230,6 +247,95 @@ export function runRepositoryContract(label: string, makeRepos: () => Promise<Co
       const created = await repos.schedules.createSchedule(scheduleInput());
       await repos.schedules.deleteSchedule(created.id);
       expect(await repos.schedules.getSchedule(created.id)).toBeUndefined();
+    });
+
+    // ---- Approvals: Phase C networkPolicy round-trip --------------------
+    it("round-trips an allowlist networkPolicy on an approval", async () => {
+      const created = await repos.approvals.createApproval(
+        approvalInput({
+          toolAllowlist: ["read_file", "http_fetch"],
+          networkPolicy: { mode: "allowlist", hosts: ["api.example.com", "*.svc.example.com"] },
+        }),
+      );
+      const found = await repos.approvals.getApprovalForKit("u1", {
+        source: "local",
+        localKitId: "k1",
+      });
+      expect(found?.networkPolicy).toEqual({
+        mode: "allowlist",
+        hosts: ["api.example.com", "*.svc.example.com"],
+      });
+      expect(found?.id).toBe(created.id);
+    });
+
+    // ---- Runs: Phase C webhook trigger + inputFiles back-compat ----------
+    it("round-trips a webhook-trigger run with inputFiles", async () => {
+      const run = await repos.runs.createRun(
+        runInput({
+          trigger: "webhook",
+          webhookId: "wh-1",
+          inputFiles: [{ path: "inputs/data.csv", s3Key: "auto-inputs/run/data.csv" }],
+        }),
+      );
+      const fetched = await repos.runs.getRun(run.id);
+      expect(fetched?.trigger).toBe("webhook");
+      expect(fetched?.webhookId).toBe("wh-1");
+      expect(fetched?.inputFiles?.[0]?.path).toBe("inputs/data.csv");
+      expect(fetched?.inputFiles?.[0]?.s3Key).toBe("auto-inputs/run/data.csv");
+    });
+
+    // ---- Webhooks (Phase C) ---------------------------------------------
+    it("creates + reads a webhook (stores only the secret hash)", async () => {
+      const created = await repos.webhooks.createWebhook(webhookInput());
+      expect(created.enabled).toBe(true);
+      expect(created.fireCount).toBe(0);
+      expect(created.lastFiredAt).toBeNull();
+      expect(created.secretHash).toBe(hashWebhookSecret("the-secret"));
+      const fetched = await repos.webhooks.getWebhook(created.id);
+      expect(fetched?.kitRef).toEqual({ source: "local", localKitId: "k1" });
+      expect(fetched?.budgetCents).toBe(200);
+    });
+
+    it("lists webhooks by user", async () => {
+      await repos.webhooks.createWebhook(webhookInput());
+      await repos.webhooks.createWebhook(webhookInput());
+      await repos.webhooks.createWebhook(webhookInput({ userId: "other" }));
+      expect((await repos.webhooks.listWebhooksByUser("u1")).length).toBe(2);
+      expect((await repos.webhooks.listWebhooksByUser("other")).length).toBe(1);
+    });
+
+    it("records a fire additively (++fireCount, stamps lastRunId/lastFiredAt)", async () => {
+      const created = await repos.webhooks.createWebhook(webhookInput());
+      await repos.webhooks.recordFire(created.id, {
+        lastFiredAt: NOW,
+        lastRunId: "run-a",
+        lastError: null,
+      });
+      await repos.webhooks.recordFire(created.id, {
+        lastFiredAt: NOW,
+        lastRunId: "run-b",
+        lastError: "boom",
+      });
+      const fetched = await repos.webhooks.getWebhook(created.id);
+      expect(fetched?.fireCount).toBe(2);
+      expect(fetched?.lastRunId).toBe("run-b");
+      expect(fetched?.lastError).toBe("boom");
+    });
+
+    it("enables/disables a webhook (getWebhook returns it regardless of state)", async () => {
+      const created = await repos.webhooks.createWebhook(webhookInput());
+      const disabled = await repos.webhooks.setEnabled(created.id, false);
+      expect(disabled?.enabled).toBe(false);
+      // Still retrievable when disabled (consumeWebhook enforces the check).
+      expect((await repos.webhooks.getWebhook(created.id))?.enabled).toBe(false);
+      const reEnabled = await repos.webhooks.setEnabled(created.id, true);
+      expect(reEnabled?.enabled).toBe(true);
+    });
+
+    it("deletes a webhook", async () => {
+      const created = await repos.webhooks.createWebhook(webhookInput());
+      await repos.webhooks.deleteWebhook(created.id);
+      expect(await repos.webhooks.getWebhook(created.id)).toBeUndefined();
     });
   });
 }
