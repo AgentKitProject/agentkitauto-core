@@ -83,7 +83,17 @@ export async function runTask(env: Env = process.env): Promise<void> {
   const resolveServiceKey = requireEnv(env, "AUTO_WORKER_SERVICE_KEY");
 
   // Storage uses the task role (default credential chain) — no static keys.
-  const storage = makeAwsAutoDeps();
+  // Phase D (hardened isolation): when the hosted Fargate task runs with a
+  // read-only root filesystem, the only writable path is the mounted scratch
+  // volume; AUTO_WORKSPACE_DIR points the per-run workspace store there. When
+  // unset (self-host / dev / pre-Phase-D), makeAwsAutoDeps falls back to the
+  // os.tmpdir() default, so this is backward-compatible.
+  const workspaceRootDir = env["AUTO_WORKSPACE_DIR"];
+  const storage = makeAwsAutoDeps(
+    workspaceRootDir && workspaceRootDir.trim() !== ""
+      ? { workspaceRootDir }
+      : {},
+  );
 
   // Platform (managed) provider + credit ledger.
   const chatProvider = createManagedAnthropicProvider();

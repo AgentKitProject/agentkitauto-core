@@ -48,6 +48,19 @@ FROM node:22-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Phase D (hardened isolation): install `gosu`, a tiny privilege-drop tool. The
+# hosted Fargate task runs with a READ-ONLY root filesystem; the only writable
+# path is a scratch volume mounted at /scratch, but Fargate mounts volumes
+# ROOT-owned. Since the final worker process runs as non-root `node`, the
+# container must (a) start as root, (b) chown the scratch mount to node, then
+# (c) exec the node app AS node. `gosu` performs that final clean drop (no
+# lingering setuid-root, none of su's TTY/signal quirks). See docker-entrypoint.sh.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gosu; \
+    rm -rf /var/lib/apt/lists/*; \
+    gosu nobody true
+
 # gateway-core is a file: dependency; auto-core's node_modules contains a symlink
 # (or copy) to it, so we ship both build outputs to satisfy the link at runtime.
 COPY --from=builder /workspace/agentkitgateway-core/dist ./agentkitgateway-core/dist
@@ -60,8 +73,19 @@ COPY --from=builder /workspace/agentkitauto-core/node_modules ./agentkitauto-cor
 
 WORKDIR /app/agentkitauto-core
 
-# Run as the non-root user that the node base image ships.
-USER node
+# Phase D (hardened isolation): entrypoint that makes the root-owned scratch
+# mount writable by `node`, then drops privileges to `node` for the worker.
+COPY agentkitauto-core/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# The compiled Fargate task main.
+# IMPORTANT: the container starts as ROOT (no `USER node` here) so the entrypoint
+# can chown the Fargate-mounted scratch volume. The entrypoint then EXECs the
+# worker via `gosu node`, so the LONG-LIVED worker process is NON-ROOT. Combined
+# with the task-def's readonlyRootFilesystem + dropped ALL caps, the final
+# process is unprivileged, capability-less, and runs on an immutable rootfs;
+# only the momentary chown step is root. Do NOT add `USER node` above this line —
+# that would start PID 1 as node and break the chown of the root-owned mount.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# The compiled Fargate task main (exec'd as node by the entrypoint).
 CMD ["node", "dist/entrypoints/run-task.js"]
