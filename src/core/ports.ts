@@ -226,7 +226,10 @@ export interface OutboundEmail {
  *                 `SES_SENDER` is unset the implementation is an INERT no-op
  *                 (returns `{ status: "skipped" }`) so missing config can never
  *                 break a run.
- *   - selfhost/ → a no-op (SMTP wiring is deferred; webhook delivery still works).
+ *   - selfhost/ → nodemailer SMTP, configured via `SMTP_HOST`/`SMTP_FROM` (+ optional
+ *                 `SMTP_PORT`/`SMTP_SECURE`/`SMTP_USER`/`SMTP_PASS`). INERT (skipped)
+ *                 when `SMTP_HOST` or `SMTP_FROM` is unset so unconfigured deployments
+ *                 never break (webhook delivery still works).
  *
  * The implementation MUST NOT throw on a delivery failure — it returns a
  * `{ status: "failed", error }` outcome so the run is never affected.

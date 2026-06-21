@@ -132,6 +132,8 @@ async function buildBackendDeps(env: Env): Promise<BackendDeps> {
     } else {
       ledger = makeFreeCreditLedger();
     }
+    // SMTP email sender: active when SMTP_HOST + SMTP_FROM are set in env;
+    // inert (skipped) otherwise — webhook delivery still works regardless.
     return { storage, ledger, emailSender: makeSelfHostEmailSender() };
   }
 
@@ -207,9 +209,10 @@ export async function runTask(env: Env = process.env): Promise<void> {
     now: () => new Date().toISOString(),
     markupBps,
     // Opt-in result delivery (Phase D). The email sender is backend-specific:
-    // SES (hosted, inert until SES_SENDER set) or the self-host no-op (SMTP
-    // deferred). Webhook delivery uses global fetch + a real DNS resolver behind
-    // the SSRF guard regardless. All best-effort — a failure never fails the run.
+    // SES (hosted, inert until SES_SENDER set) or the SMTP sender (selfhost,
+    // inert until SMTP_HOST + SMTP_FROM are set). Webhook delivery uses global
+    // fetch + a real DNS resolver behind the SSRF guard regardless.
+    // All best-effort — a delivery failure never fails the run.
     emailSender,
     deliveryFetch: globalFetch,
     deliveryResolver: dnsResolver,
