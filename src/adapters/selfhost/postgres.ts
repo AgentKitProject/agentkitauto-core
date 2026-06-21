@@ -530,3 +530,132 @@ export function makeSelfHostAutoDeps(options: MakeSelfHostAutoDepsOptions): Auto
     inputs: options.inputs ?? new LocalInputStore(),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Schema (self-host)
+// ---------------------------------------------------------------------------
+
+/**
+ * The idempotent CREATE TABLE IF NOT EXISTS schema for the Auto self-host
+ * Postgres tables (auto_runs, auto_approvals, auto_schedules, auto_webhooks).
+ *
+ * This is the EXACT content of `schema.sql` embedded as a string so it ships in
+ * the compiled `dist/` without needing the .sql file at runtime (the worker +
+ * web-forge selfhost backend run it on startup via `ensureAutoSchema`). When you
+ * edit schema.sql, keep this string in sync (a test asserts they match).
+ */
+export const AUTO_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS auto_runs (
+  id                TEXT        NOT NULL PRIMARY KEY,
+  user_id           TEXT        NOT NULL,
+  kit_ref           JSONB       NOT NULL,
+  status            TEXT        NOT NULL,
+  input             JSONB       NOT NULL,
+  budget_cents      INTEGER     NOT NULL,
+  spent_cents       INTEGER     NOT NULL DEFAULT 0,
+  spent_inference_cents   INTEGER NOT NULL DEFAULT 0,
+  spent_compute_cents     INTEGER NOT NULL DEFAULT 0,
+  inference_mode          TEXT    NOT NULL DEFAULT 'managed',
+  is_cloud_run            BOOLEAN NOT NULL DEFAULT FALSE,
+  cloud_run_cents_per_min INTEGER NOT NULL DEFAULT 0,
+  model             TEXT        NOT NULL,
+  created_at        TEXT        NOT NULL,
+  started_at        TEXT,
+  finished_at       TEXT,
+  result            JSONB,
+  error             TEXT,
+  audit_log         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  workspace_id      TEXT,
+  cancel_requested  BOOLEAN     NOT NULL DEFAULT FALSE,
+  trigger           TEXT        NOT NULL DEFAULT 'on_demand',
+  schedule_id       TEXT,
+  webhook_id        TEXT,
+  input_files       JSONB
+);
+
+CREATE INDEX IF NOT EXISTS auto_runs_user_idx ON auto_runs (user_id, created_at DESC);
+
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS spent_inference_cents   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS spent_compute_cents     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS inference_mode          TEXT    NOT NULL DEFAULT 'managed';
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS is_cloud_run            BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS cloud_run_cents_per_min INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS auto_approvals (
+  id                TEXT        NOT NULL PRIMARY KEY,
+  user_id           TEXT        NOT NULL,
+  kit_ref           JSONB       NOT NULL,
+  user_kit_key      TEXT        NOT NULL,
+  scope             TEXT        NOT NULL,
+  tool_allowlist    JSONB       NOT NULL,
+  network_policy    JSONB       NOT NULL,
+  max_budget_cents  INTEGER     NOT NULL,
+  created_at        TEXT        NOT NULL,
+  revoked_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS auto_approvals_user_idx ON auto_approvals (user_id);
+CREATE INDEX IF NOT EXISTS auto_approvals_user_kit_idx ON auto_approvals (user_kit_key);
+
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS trigger     TEXT NOT NULL DEFAULT 'on_demand';
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS schedule_id TEXT;
+
+CREATE TABLE IF NOT EXISTS auto_schedules (
+  id                TEXT        NOT NULL PRIMARY KEY,
+  user_id           TEXT        NOT NULL,
+  kit_ref           JSONB       NOT NULL,
+  cron              TEXT        NOT NULL,
+  timezone          TEXT        NOT NULL DEFAULT 'UTC',
+  input             JSONB       NOT NULL,
+  budget_cents      INTEGER     NOT NULL,
+  model             TEXT        NOT NULL,
+  approval_id       TEXT        NOT NULL,
+  inference_mode    TEXT,
+  enabled           BOOLEAN     NOT NULL DEFAULT TRUE,
+  created_at        TEXT        NOT NULL,
+  updated_at        TEXT        NOT NULL,
+  last_run_at       TEXT,
+  last_run_id       TEXT,
+  next_run_at       TEXT        NOT NULL,
+  last_error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS auto_schedules_user_idx ON auto_schedules (user_id);
+CREATE INDEX IF NOT EXISTS auto_schedules_due_idx ON auto_schedules (enabled, next_run_at);
+
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS webhook_id  TEXT;
+ALTER TABLE auto_runs ADD COLUMN IF NOT EXISTS input_files JSONB;
+
+CREATE TABLE IF NOT EXISTS auto_webhooks (
+  id                TEXT        NOT NULL PRIMARY KEY,
+  user_id           TEXT        NOT NULL,
+  kit_ref           JSONB       NOT NULL,
+  approval_id       TEXT        NOT NULL,
+  budget_cents      INTEGER     NOT NULL,
+  model             TEXT        NOT NULL,
+  inference_mode    TEXT,
+  enabled           BOOLEAN     NOT NULL DEFAULT TRUE,
+  secret_hash       TEXT        NOT NULL,
+  created_at        TEXT        NOT NULL,
+  last_fired_at     TEXT,
+  last_run_id       TEXT,
+  last_error        TEXT,
+  fire_count        INTEGER     NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS auto_webhooks_user_idx ON auto_webhooks (user_id);
+`;
+
+const ensuredAutoSchema = new WeakSet<object>();
+
+/**
+ * Idempotently create the Auto self-host schema. Safe to call on every startup /
+ * adapter construction (CREATE TABLE / ADD COLUMN IF NOT EXISTS). Memoised per
+ * pool so repeated calls are cheap. The web-forge selfhost backend calls this
+ * before first use, and the self-host worker entrypoint calls it on boot.
+ */
+export async function ensureAutoSchema(pool: PgPool): Promise<void> {
+  if (ensuredAutoSchema.has(pool)) return;
+  await pool.query(AUTO_SCHEMA_SQL);
+  ensuredAutoSchema.add(pool);
+}

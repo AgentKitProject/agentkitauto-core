@@ -22,11 +22,20 @@ import {
   createManagedAnthropicProvider,
   loadDynamoTableNames,
   type ChatProvider,
+  type CreditLedgerRepository,
 } from "@agentkitforge/gateway-core";
 import { lookup } from "node:dns/promises";
 import type { InferenceMode } from "../core/types.js";
+import type { AutoStorageDeps, EmailSender } from "../core/ports.js";
 import { awsClientEnv, makeAwsAutoDeps } from "../adapters/aws/index.js";
 import { makeSesEmailSender } from "../adapters/aws/ses-email-sender.js";
+import {
+  ensureAutoSchema,
+  makeSelfHostAutoDeps,
+  type PgPool,
+} from "../adapters/selfhost/postgres.js";
+import { makeSelfHostEmailSender } from "../adapters/selfhost/email-sender.js";
+import { makeFreeCreditLedger } from "../adapters/selfhost/free-ledger.js";
 import type { DnsResolver, FetchFn } from "../core/http-fetch.js";
 import {
   fetchResolveContext,
@@ -70,6 +79,78 @@ function parseIntEnv(env: Env, key: string, fallback: number): number {
   return n;
 }
 
+/** The per-backend persistence + delivery deps the worker needs. */
+interface BackendDeps {
+  storage: AutoStorageDeps;
+  ledger: CreditLedgerRepository;
+  emailSender: EmailSender;
+}
+
+/**
+ * Selects the worker's storage/ledger/email backend from the environment so the
+ * SAME worker image runs on hosted (AWS) and self-host (k8s + Postgres):
+ *
+ *   - AWS (default): DynamoDB storage via the task role + the Dynamo credit
+ *     ledger + the SES email sender. This is the hosted Fargate path (unchanged).
+ *
+ *   - SELF-HOST (AUTO_BACKEND=selfhost OR KITSTORE_BACKEND=selfhost): Postgres
+ *     storage (DATABASE_URL) + FsWorkspaceStore on the mounted scratch dir, the
+ *     self-host (no-op) email sender (SMTP deferred; webhook delivery still
+ *     works), and — per AUTO_SELFHOST_BILLING — either the inert FREE ledger
+ *     (default: BYO key, no metering) or the gateway-core Postgres credit ledger
+ *     ("managed"). The Auto schema is ensured idempotently on boot.
+ */
+async function buildBackendDeps(env: Env): Promise<BackendDeps> {
+  const backend = (
+    env["AUTO_BACKEND"] ||
+    env["KITSTORE_BACKEND"] ||
+    "aws"
+  ).toLowerCase();
+  const workspaceRootDir = env["AUTO_WORKSPACE_DIR"];
+
+  if (backend === "selfhost") {
+    // Lazy `pg` import — only the self-host worker path constructs a real Pool,
+    // mirroring the lazy AWS-client discipline elsewhere.
+    const { Pool } = await import("pg");
+    const pool = new Pool({
+      connectionString: requireEnv(env, "DATABASE_URL"),
+    }) as unknown as PgPool;
+    // Idempotent CREATE TABLE IF NOT EXISTS — a self-host worker can run before
+    // the web app has created the tables.
+    await ensureAutoSchema(pool);
+    const storage = makeSelfHostAutoDeps({
+      pool,
+      ...(workspaceRootDir && workspaceRootDir.trim() !== "" ? { workspaceRootDir } : {}),
+    });
+    // Billing policy: FREE (default) → inert ledger (BYO, never metered);
+    // "managed" → the gateway-core Postgres credit ledger over the SAME pool.
+    const billing = (env["AUTO_SELFHOST_BILLING"] || "free").toLowerCase();
+    let ledger: CreditLedgerRepository;
+    if (billing === "managed") {
+      const { PostgresCreditLedgerRepository } = await import("@agentkitforge/gateway-core");
+      ledger = new PostgresCreditLedgerRepository(pool as never);
+    } else {
+      ledger = makeFreeCreditLedger();
+    }
+    return { storage, ledger, emailSender: makeSelfHostEmailSender() };
+  }
+
+  // AWS (hosted) — unchanged. Storage uses the task role (default credential
+  // chain); the Dynamo ledger + SES sender as before.
+  const storage = makeAwsAutoDeps(
+    workspaceRootDir && workspaceRootDir.trim() !== "" ? { workspaceRootDir } : {},
+  );
+  const ledger = new DynamoCreditLedgerRepository(
+    createDynamoDBDocumentClient(awsClientEnv(env)),
+    loadDynamoTableNames(env),
+  );
+  const emailSender = makeSesEmailSender(
+    { clientConfig: { region: env["FORGE_AWS_REGION"] || env["AWS_REGION"] || "us-east-1" } },
+    env,
+  );
+  return { storage, ledger, emailSender };
+}
+
 /**
  * Executes the run identified by `RUN_ID`. Pure: throws on any failure (missing
  * env, denied approval, or a "failed" terminal status) so the caller decides
@@ -82,25 +163,15 @@ export async function runTask(env: Env = process.env): Promise<void> {
   const resolveBaseUrl = requireEnv(env, "WEB_FORGE_INTERNAL_URL");
   const resolveServiceKey = requireEnv(env, "AUTO_WORKER_SERVICE_KEY");
 
-  // Storage uses the task role (default credential chain) — no static keys.
-  // Phase D (hardened isolation): when the hosted Fargate task runs with a
-  // read-only root filesystem, the only writable path is the mounted scratch
-  // volume; AUTO_WORKSPACE_DIR points the per-run workspace store there. When
-  // unset (self-host / dev / pre-Phase-D), makeAwsAutoDeps falls back to the
-  // os.tmpdir() default, so this is backward-compatible.
-  const workspaceRootDir = env["AUTO_WORKSPACE_DIR"];
-  const storage = makeAwsAutoDeps(
-    workspaceRootDir && workspaceRootDir.trim() !== ""
-      ? { workspaceRootDir }
-      : {},
-  );
+  // Storage + ledger + email sender are backend-keyed (AWS hosted vs Postgres
+  // self-host). Phase D (hardened isolation): AUTO_WORKSPACE_DIR points per-run
+  // workspaces at the writable scratch mount under a read-only root filesystem;
+  // when unset both backends fall back to os.tmpdir() (backward-compatible).
+  const { storage, ledger, emailSender } = await buildBackendDeps(env);
 
-  // Platform (managed) provider + credit ledger.
+  // Platform (managed) provider. In self-host FREE mode every run is BYO so this
+  // is never exercised; it stays inert (throws) when ANTHROPIC_API_KEY is unset.
   const chatProvider = createManagedAnthropicProvider();
-  const ledger = new DynamoCreditLedgerRepository(
-    createDynamoDBDocumentClient(awsClientEnv(env)),
-    loadDynamoTableNames(env),
-  );
 
   // Single up-front fetch of the resolve payload: it carries BOTH the kit
   // context AND the per-run inference mode / BYO provider config. We reuse the
@@ -135,13 +206,11 @@ export async function runTask(env: Env = process.env): Promise<void> {
     resolveKitContext: toResolveKitContext(payload),
     now: () => new Date().toISOString(),
     markupBps,
-    // Opt-in result delivery (Phase D). SES sender is inert when SES_SENDER is
-    // unset; webhook delivery uses global fetch + a real DNS resolver behind the
-    // SSRF guard. All best-effort — a delivery failure never fails the run.
-    emailSender: makeSesEmailSender(
-      { clientConfig: { region: env["FORGE_AWS_REGION"] || env["AWS_REGION"] || "us-east-1" } },
-      env,
-    ),
+    // Opt-in result delivery (Phase D). The email sender is backend-specific:
+    // SES (hosted, inert until SES_SENDER set) or the self-host no-op (SMTP
+    // deferred). Webhook delivery uses global fetch + a real DNS resolver behind
+    // the SSRF guard regardless. All best-effort — a failure never fails the run.
+    emailSender,
     deliveryFetch: globalFetch,
     deliveryResolver: dnsResolver,
     ...(env["AUTO_MAX_TOKENS"] !== undefined

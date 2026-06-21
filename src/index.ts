@@ -211,6 +211,8 @@ export type { SesEmailSenderOptions } from "./adapters/aws/ses-email-sender.js";
 
 // ---- Self-host adapter ---------------------------------------------------
 export {
+  AUTO_SCHEMA_SQL,
+  ensureAutoSchema,
   makeSelfHostAutoDeps,
   PostgresAutoApprovalRepository,
   PostgresAutoRunRepository,
@@ -222,3 +224,4 @@ export type {
   PgPool,
 } from "./adapters/selfhost/postgres.js";
 export { makeSelfHostEmailSender } from "./adapters/selfhost/email-sender.js";
+export { makeFreeCreditLedger } from "./adapters/selfhost/free-ledger.js";
