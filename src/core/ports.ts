@@ -206,6 +206,43 @@ export interface StagedInputFile {
 }
 
 // ---------------------------------------------------------------------------
+// EmailSender (Phase D — opt-in result delivery)
+// ---------------------------------------------------------------------------
+
+/** One email to deliver (the DeliveryService builds the subject + body). */
+export interface OutboundEmail {
+  /** Recipient addresses (basic-format validated upstream). */
+  to: string[];
+  subject: string;
+  /** Plain-text body (always present). */
+  text: string;
+  /** Optional HTML body. */
+  html?: string;
+}
+
+/**
+ * Sends a notification email (Phase D result delivery). Provider-specific:
+ *   - aws/      → SES v2 (`SendEmailCommand`), sender from env `SES_SENDER`. When
+ *                 `SES_SENDER` is unset the implementation is an INERT no-op
+ *                 (returns `{ status: "skipped" }`) so missing config can never
+ *                 break a run.
+ *   - selfhost/ → a no-op (SMTP wiring is deferred; webhook delivery still works).
+ *
+ * The implementation MUST NOT throw on a delivery failure — it returns a
+ * `{ status: "failed", error }` outcome so the run is never affected.
+ */
+export interface EmailSender {
+  sendEmail(email: OutboundEmail): Promise<EmailSendResult>;
+}
+
+/** The result of one `EmailSender.sendEmail` call. */
+export interface EmailSendResult {
+  status: "delivered" | "failed" | "skipped";
+  /** Failure / skip detail (absent on a clean delivery). */
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
 // WorkspaceStore (the "hands" substrate)
 // ---------------------------------------------------------------------------
 

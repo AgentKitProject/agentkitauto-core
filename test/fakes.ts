@@ -49,6 +49,7 @@ export class InMemoryRunRepo implements AutoRunRepository {
         : {}),
       model: input.model,
       createdAt: input.createdAt,
+      ...(input.deliveryConfig !== undefined ? { deliveryConfig: input.deliveryConfig } : {}),
       auditLog: [],
       cancelRequested: false,
     };

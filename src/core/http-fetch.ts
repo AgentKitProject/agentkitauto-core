@@ -165,7 +165,10 @@ export async function guardedHttpFetch(
     throw new HttpFetchError(`Only https is permitted (got ${parsed.protocol}).`);
   }
 
-  const host = parsed.hostname;
+  // URL.hostname keeps the surrounding brackets for IPv6 literals (e.g. "[::1]"),
+  // which makes isIP()/isBlockedIp() miss them — a SSRF bypass. Strip the brackets
+  // so a literal IPv6 host is checked as the bare IP.
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
 
   // (b) Allowlist check.
   if (!hostMatchesAllowlist(host, opts.allowedHosts)) {

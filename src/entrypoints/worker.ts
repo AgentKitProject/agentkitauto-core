@@ -18,10 +18,12 @@
  */
 
 import type { ChatProvider, CreditLedgerRepository, ToolDefinition } from "@agentkitforge/gateway-core";
-import type { AutoStorageDeps } from "../core/ports.js";
+import type { AutoStorageDeps, EmailSender } from "../core/ports.js";
 import type { AutoApproval, AutoRun, InferenceMode } from "../core/types.js";
 import { makeSandboxExecutor } from "../core/sandbox-executor.js";
 import { runAutoRun, type RunAutoRunResult } from "../core/run-driver.js";
+import { deliverResult } from "../core/delivery.js";
+import type { DnsResolver, FetchFn } from "../core/http-fetch.js";
 
 /** The kit context the run needs: a system prompt + the tools the kit declares. */
 export interface ResolvedKitContext {
@@ -66,6 +68,18 @@ export interface ProcessAutoRunDeps {
   markupBps?: number;
   maxTokens?: number;
   maxToolRounds?: number;
+  /**
+   * Opt-in result delivery (Phase D). When a run carries a `deliveryConfig`,
+   * these deps are used AFTER the run reaches a terminal status to notify the
+   * user. Delivery is best-effort — a failure here NEVER fails the run.
+   *   - `emailSender`: provider-specific (SES on aws / no-op self-host). When
+   *     omitted, email channels are skipped.
+   *   - `deliveryFetch` + `deliveryResolver`: the webhook POST + its SSRF guard.
+   *     When either is omitted, webhook channels are skipped.
+   */
+  emailSender?: EmailSender;
+  deliveryFetch?: FetchFn;
+  deliveryResolver?: DnsResolver;
 }
 
 /** Raised + recorded when the approval gate denies a run. */
@@ -161,6 +175,37 @@ export async function processAutoRun(
       },
       ...(deps.maxToolRounds !== undefined ? { maxToolRounds: deps.maxToolRounds } : {}),
     });
+
+    // ---- Opt-in result delivery (Phase D) --------------------------------
+    // Fires AFTER the run reaches a terminal status (success OR failure — the
+    // user wants to be notified of failures too). Best-effort: any delivery
+    // failure is logged + audited inside deliverResult, never fatal to the run.
+    if (run.deliveryConfig) {
+      try {
+        await deliverResult({
+          run: { ...runWithWs, status: result.status, finishedAt: now() },
+          result: {
+            status: result.status,
+            output: result.result?.output ?? "",
+            spentCents: result.spentCents,
+          },
+          config: run.deliveryConfig,
+          deps: {
+            runs,
+            ...(deps.emailSender ? { emailSender: deps.emailSender } : {}),
+            ...(deps.deliveryFetch ? { fetchFn: deps.deliveryFetch } : {}),
+            ...(deps.deliveryResolver ? { resolver: deps.deliveryResolver } : {}),
+          },
+          now,
+        });
+      } catch (err) {
+        // Defensive: deliverResult is contracted not to throw, but never let a
+        // delivery hiccup mask the run's real terminal result.
+        console.error(
+          `Auto run ${run.id} delivery error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     return result;
   } finally {

@@ -28,6 +28,11 @@ export type {
   CreateRunInput,
   CreateScheduleInput,
   CreateWebhookInput,
+  DeliveryChannelOutcome,
+  DeliveryChannelStatus,
+  DeliveryConfig,
+  DeliveryOutcome,
+  DeliveryWebhook,
   InferenceMode,
   KitRef,
   NetworkPolicy,
@@ -44,11 +49,14 @@ export {
   autoRunStatusSchema,
   autoScheduleSchema,
   autoWebhookSchema,
+  deliveryConfigSchema,
+  deliveryWebhookSchema,
   DENY_ALL_NETWORK_POLICY,
   kitRefKey,
   kitRefSchema,
   networkPolicySchema,
   normalizeNetworkPolicy,
+  validateDeliveryConfig,
 } from "./core/types.js";
 
 // ---- Ports ---------------------------------------------------------------
@@ -59,7 +67,10 @@ export type {
   AutoStorageDeps,
   AutoWebhookRepository,
   ConfigProvider,
+  EmailSender,
+  EmailSendResult,
   InputStore,
+  OutboundEmail,
   ScheduleRunResult,
   StagedInputFile,
   WorkspaceStore,
@@ -106,6 +117,19 @@ export type {
   HttpFetchOptions,
   HttpFetchResult,
 } from "./core/http-fetch.js";
+
+// ---- Result delivery (Phase D) -------------------------------------------
+export {
+  buildWebhookPayload,
+  deliverResult,
+  signWebhookBody,
+} from "./core/delivery.js";
+export type {
+  DeliverResultArgs,
+  DeliverResultDeps,
+  DeliveryResultInput,
+  DeliveryWebhookPayload,
+} from "./core/delivery.js";
 
 // ---- User-provided inputs (Phase C) --------------------------------------
 export {
@@ -182,6 +206,8 @@ export type {
 } from "./adapters/aws/index.js";
 export { inputObjectKey, S3InputStore } from "./adapters/aws/s3-input-store.js";
 export type { S3InputStoreOptions } from "./adapters/aws/s3-input-store.js";
+export { makeSesEmailSender } from "./adapters/aws/ses-email-sender.js";
+export type { SesEmailSenderOptions } from "./adapters/aws/ses-email-sender.js";
 
 // ---- Self-host adapter ---------------------------------------------------
 export {
@@ -195,3 +221,4 @@ export type {
   MakeSelfHostAutoDepsOptions,
   PgPool,
 } from "./adapters/selfhost/postgres.js";
+export { makeSelfHostEmailSender } from "./adapters/selfhost/email-sender.js";

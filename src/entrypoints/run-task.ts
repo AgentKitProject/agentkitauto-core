@@ -23,13 +23,32 @@ import {
   loadDynamoTableNames,
   type ChatProvider,
 } from "@agentkitforge/gateway-core";
+import { lookup } from "node:dns/promises";
 import type { InferenceMode } from "../core/types.js";
 import { awsClientEnv, makeAwsAutoDeps } from "../adapters/aws/index.js";
+import { makeSesEmailSender } from "../adapters/aws/ses-email-sender.js";
+import type { DnsResolver, FetchFn } from "../core/http-fetch.js";
 import {
   fetchResolveContext,
   toResolveKitContext,
 } from "../core/http-resolve-context.js";
 import { processAutoRun, type ProcessAutoRunDeps } from "./worker.js";
+
+/** Real DNS resolver for webhook-delivery SSRF guard (A + AAAA). */
+const dnsResolver: DnsResolver = async (hostname: string): Promise<string[]> => {
+  const records = await lookup(hostname, { all: true });
+  return records.map((r) => r.address);
+};
+
+/** Global fetch adapted to the injected FetchFn shape (webhook delivery). */
+const globalFetch: FetchFn = async (url, init) => {
+  const res = await fetch(url, init as RequestInit | undefined);
+  return {
+    status: res.status,
+    headers: { forEach: (cb) => res.headers.forEach(cb) },
+    text: () => res.text(),
+  };
+};
 
 type Env = Record<string, string | undefined>;
 
@@ -106,6 +125,15 @@ export async function runTask(env: Env = process.env): Promise<void> {
     resolveKitContext: toResolveKitContext(payload),
     now: () => new Date().toISOString(),
     markupBps,
+    // Opt-in result delivery (Phase D). SES sender is inert when SES_SENDER is
+    // unset; webhook delivery uses global fetch + a real DNS resolver behind the
+    // SSRF guard. All best-effort — a delivery failure never fails the run.
+    emailSender: makeSesEmailSender(
+      { clientConfig: { region: env["FORGE_AWS_REGION"] || env["AWS_REGION"] || "us-east-1" } },
+      env,
+    ),
+    deliveryFetch: globalFetch,
+    deliveryResolver: dnsResolver,
     ...(env["AUTO_MAX_TOKENS"] !== undefined
       ? { maxTokens: parseIntEnv(env, "AUTO_MAX_TOKENS", 0) }
       : {}),
