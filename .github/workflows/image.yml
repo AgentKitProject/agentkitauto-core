@@ -1,0 +1,83 @@
+name: Build and push worker image
+
+# Publishes the AgentKitAuto worker container image to GHCR so hosted (Fargate)
+# and self-host (k8s, AUTO_DISPATCH=k8s) deployments can pull it.
+#
+# CROSS-PACKAGE BUILD CONTEXT (IMPORTANT)
+# `@agentkitforge/auto-core` depends on the SIBLING package
+# `@agentkitforge/gateway-core` via `github:AgentKitProject/agentkitgateway-core`,
+# and the Dockerfile (see its header) expects to build from a PARENT workspace
+# dir that contains BOTH repos as subdirectories:
+#
+#     workspace/
+#       agentkitauto-core/     (this repo; Dockerfile + entrypoint live here)
+#       agentkitgateway-core/  (the file:../ sibling the Dockerfile COPYs + builds)
+#
+# So we lay out that exact tree under the runner workspace: check this repo into
+# `agentkitauto-core/` and the gateway sibling into `agentkitgateway-core/`, then
+# build with context=. (the parent) and -f agentkitauto-core/Dockerfile.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout auto-core (into workspace subdir)
+        uses: actions/checkout@v4
+        with:
+          path: agentkitauto-core
+
+      - name: Checkout gateway-core sibling (file: dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: AgentKitProject/agentkitgateway-core
+          path: agentkitgateway-core
+
+      - name: Set up QEMU (for cross-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/agentkitauto-worker
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # Context is the PARENT workspace dir holding BOTH repos as siblings;
+          # the Dockerfile COPYs agentkitgateway-core/ and agentkitauto-core/ from it.
+          context: .
+          file: agentkitauto-core/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
