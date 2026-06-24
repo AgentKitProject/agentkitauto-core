@@ -38,7 +38,7 @@ jobs:
         with:
           path: agentkitauto-core
 
-      - name: Checkout gateway-core sibling (file: dependency)
+      - name: "Checkout gateway-core sibling (file: dependency)"
         uses: actions/checkout@v4
         with:
           repository: AgentKitProject/agentkitgateway-core
